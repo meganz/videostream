@@ -10,6 +10,7 @@ var locale = require('./bundle/locale');
 // if we want to ignore more than this many bytes, request a new stream.
 // if we want to ignore fewer, just skip them.
 var FIND_MOOV_SEEK_SIZE = 4096;
+var SILENT_PLAYBACK = parseInt(localStorage.vsna);
 
 module.exports = MP4Remuxer
 
@@ -19,9 +20,9 @@ function MP4Remuxer (file, opts) {
 	self._tracks = []
 	self._file = file
 	self._decoder = null
-	self._videoOnly = opts && opts.videoOnly;
+    self._videoOnly = opts && opts.videoOnly || SILENT_PLAYBACK;
 	self._bogusAudioTracks = opts && opts.bat || Object.create(null);
-	self._findMoov(0)
+    vsNT(self._findMoov.bind(self, 0));
 }
 
 inherits(MP4Remuxer, EventEmitter)

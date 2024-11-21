@@ -180,7 +180,8 @@ Megaify.prototype._transform = function(chunk, enc, cb) {
             'while(i--) streams[i] = arguments[i];');
 
         // we don't need fs nor process
-        chunk = chunk.replace("var fs = require('fs')", '');
+        chunk = chunk.replace("var fs", '');
+        chunk = chunk.replace("fs = require('fs')", '');
         chunk = chunk.replace('var isFS = function', 'if(0)$&');
         chunk = chunk.replace('isFS(stream)', '0');
         chunk = chunk.replace('var ancient =', '//$&');

@@ -835,7 +835,7 @@ Streamer.prototype.handleEvent = function(ev) {
     var target = ev.target;
     var videoFile = this.file;
 
-    if (d && ev.type !== 'timeupdate' || d > 2) {
+    if (d && ev.type !== 'timeupdate' || d > 4) {
         console.debug('Event(%s)', ev.type, target, ev);
     }
     this.state = ev.type;
@@ -1024,6 +1024,13 @@ Streamer.prototype.play = function() {
                 if (d) {
                     console.debug('video.play() failed...', ex);
                 }
+
+                var f = self.file || !1;
+                if (f.canplay && ex && ex.name === 'NotAllowedError') {
+                    f.bgtask = -1;
+                    f.minCache = 0x400000;
+                    vsNT(self.notify.bind(self, 'cannot-play', ex));
+                }
             });
         }
     }
@@ -1128,13 +1135,14 @@ Streamer.prototype._setActivityTimer = function(force) {
 };
 
 Streamer.prototype.getImage = function(w, h) {
+    var tick = 96;
     var self = this;
     var video = this.video;
 
     return new Promise(function _(resolve, reject) {
-        if (!video.videoWidth) {
+        if (!video.videoWidth || video.error) {
             queueMicrotask(function() {
-                reject(-9);
+                reject(video.error || -9);
             });
             return;
         }
@@ -1164,8 +1172,7 @@ Streamer.prototype.getImage = function(w, h) {
                 console.debug('[Streamer.getImage()] Got +70% of black pixels, retrying...');
             }
 
-            if (video.paused || video.ended || window.safari) {
-                // nb: https://bugs.webkit.org/show_bug.cgi?id=206812
+            if (video.paused || video.ended || !--tick) {
                 queueMicrotask(function() {
                     reject(-5);
                 });
@@ -1299,7 +1306,7 @@ Object.defineProperty(Streamer.prototype, 'playbackRate', {
         var stream = this.stream;
         return stream instanceof AudioStream ? stream.playbackRate : video && video.playbackRate;
     },
-    set: function(v) {
+    set: tryCatch(function(v) {
         var video = this.video;
         var stream = this.stream;
 
@@ -1309,7 +1316,7 @@ Object.defineProperty(Streamer.prototype, 'playbackRate', {
         else if (video) {
             video.playbackRate = v;
         }
-    }
+    })
 });
 
 Object.defineProperty(Streamer.prototype, 'gain', {

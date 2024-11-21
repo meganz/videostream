@@ -26,7 +26,9 @@ function AudioStream(file, mediaElem, opts) {
     self._ended = false;
     self._bytesRead = 0;
     self._playOffset = 0;
+    self._stopOffset = 0;
     self._timeOffset = 0;
+    self._played = false;
     self._hasAudio = true;
     self._stopping = false;
     self._decoding = false;
@@ -107,6 +109,7 @@ function AudioStream(file, mediaElem, opts) {
         // log('onplay', self._pauseOffset);
 
         if (self._audioStream) {
+            self._played = true;
             self._play(self._ended ? 0 : self._timeOffset);
         }
     };
@@ -207,7 +210,14 @@ AudioStream.prototype._decode = function(opts) {
                 }, 2e3);
                 return;
             }
-            data = data.buffer.slice(0, self._bytesRead || undefined);
+            try {
+                data = data.buffer.slice(0, self._bytesRead || undefined);
+            }
+            catch (ex) {
+                // running out of memory? move on and don't destroy until 'done'
+                log(ex);
+                return;
+            }
         }
         len = data.byteLength;
 
@@ -281,6 +291,10 @@ AudioStream.prototype._setup = function(autoplay, time, buffer) {
         if (d > 1) {
             log('new chunk arrived...', [buffer], buffer.duration, time);
         }
+        var o = self._stopOffset;
+        if (o && o < self._audioBuffer.duration) {
+            self._played = -1;
+        }
         self._audioBuffer = buffer;
         self._play(time);
         self.emit('duration', buffer.duration);
@@ -311,11 +325,11 @@ AudioStream.prototype._setup = function(autoplay, time, buffer) {
         // legacy Web Audio API support.
         self._audioStream = audioContext.destination;
     }
-    self._play(time | 0);
 
-    if (!autoplay) {
-        self._onPause();
+    if (autoplay) {
+        self._played = 1
     }
+    self._play(time | 0);
 
     elm.srcObject = new MediaStream(tracks);
     // elm.srcObject = self._audioStream.stream;
@@ -345,8 +359,11 @@ AudioStream.prototype._stop = function() {
         visualiser._stop();
     }
 
-    self._timeOffset = pos;
-    self._playOffset = ctx.currentTime;
+    if (self._played) {
+        self._timeOffset = pos;
+        self._stopOffset = pos;
+        self._playOffset = ctx.currentTime;
+    }
     self._stopping = false;
 };
 
@@ -396,18 +413,37 @@ AudioStream.prototype.__tryPlay = function(time) {
     source.playbackRate.value = rate;
 
     self._audioSource = source;
-    self._playOffset = context.currentTime;
-    self._timeOffset = time;
-    self._ended = false;
+
+    if (self._played > 0) {
+        self._playOffset = context.currentTime;
+        self._stopOffset = 0;
+        self._timeOffset = time;
+        self._ended = false;
+        self._setPBS(1);
+    }
 
     if (visualiser) {
         visualiser._start();
     }
+};
 
-    var f = self._file;
-    f.paused = false;
-    f.playing = true;
-    self.emit('activity');
+AudioStream.prototype._setPBS = function(v) {
+    var self = this;
+
+    delay('vs.audio.playback', function() {
+        var f = self._file;
+        if (f && !self.destroyed) {
+            var s = f.playing;
+
+            f.paused = !v;
+            if ((f.playing = !!v)) {
+                self.emit('activity');
+            }
+            else if (s) {
+                self.emit('inactivity');
+            }
+        }
+    });
 };
 
 AudioStream.prototype._resume = SoonFc(40, function() {
@@ -438,8 +474,9 @@ AudioStream.prototype._endOfStream = tryCatch(function() {
 
 AudioStream.prototype._captureStream = function(canvas) {
     var stream;
+    var raf = !parseInt(localStorage.vsnraf);
 
-    try {
+    if (!raf) try {
         var t = window.CanvasCaptureMediaStreamTrack;
         if (t && typeof t.prototype.requestFrame === 'function') {
             var tmp = canvas.captureStream(0);
@@ -457,7 +494,9 @@ AudioStream.prototype._captureStream = function(canvas) {
     }
 
     if (!stream) {
-        log('This browser does lack CanvasCaptureMediaStreamTrack.requestFrame');
+        if (!raf) {
+            log('This browser does lack CanvasCaptureMediaStreamTrack.requestFrame');
+        }
         stream = canvas.captureStream(24);
     }
 
@@ -489,6 +528,9 @@ Object.defineProperty(AudioStream.prototype, 'playbackRate', {
 Object.defineProperty(AudioStream.prototype, 'currentTime', {
     get: function() {
         var self = this;
+        if (self._stopOffset || !self._played) {
+            return self._stopOffset;
+        }
         var audioBuffer = self._audioBuffer || false;
         var context = self._audioContext;
         var result = this._timeOffset + ((context.currentTime - self._playOffset) * self.playbackRate);
@@ -503,10 +545,7 @@ Object.defineProperty(AudioStream.prototype, 'currentTime', {
             }
             else if (!self._stopping) {
                 self._onPause();
-                self.emit('inactivity');
-                var f = self._file;
-                f.paused = true;
-                f.playing = false;
+                self._setPBS(0);
             }
         }
 
@@ -523,7 +562,7 @@ function AudioVisualiser(stream, fftSize) {
     self._barWidth = 4;
     self._byteData = null;
     self._stream = stream;
-    self._fftSize = fftSize || 0x1000;
+    self._fftSize = fftSize || 2048;
     self._hasFocus = document.hasFocus();
 
     /*if (videoElement.poster) {
@@ -589,8 +628,8 @@ AudioVisualiser.prototype._draw = function() {
     var analyser = stream._audioAnalyser;
     var $video = $(videoElement).parent();
 
-    canvas.width = $video.outerWidth() + 16 & -16;
-    canvas.height = $video.outerHeight() + 16 & -16;
+    canvas.width = ($video.outerWidth() + 15) & -15;
+    canvas.height = ($video.outerHeight() + 15) & -15;
 
     self.init(ctx, canvas.width, canvas.height, canvas);
 
@@ -608,6 +647,9 @@ AudioVisualiser.prototype._draw = function() {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             if (stream.requestFrame) {
                 stream.requestFrame();
+            }
+            if (!self._hasFocus) {
+                ++tick;
             }
         }
     };
@@ -638,9 +680,9 @@ function Visualiser(stream, fftSize) {
 inherits(Visualiser, AudioVisualiser);
 
 Visualiser.prototype.init = function(ctx, width, height, canvas) {
-    var _gradient = ctx.createLinearGradient(0, 0, 0, 300);
-    _gradient.addColorStop(1.00, 'rgba(96, 96, 98, 0.6)');
-    _gradient.addColorStop(0.75, 'rgba(26, 24, 24, 0.8)');
+    var _gradient = ctx.createLinearGradient(0, ~~(height / 3), 0, ~~(height / 1.5));
+    _gradient.addColorStop(1.00, 'rgba(96, 96, 98, .3)');
+    _gradient.addColorStop(0.35, 'rgba(74, 69, 74, .6)');
     this.gradient = _gradient;
 
     /**
@@ -702,14 +744,19 @@ Visualiser.prototype.draw = function(ctx, width, height) {
     analyser.getByteTimeDomainData(data);
 
     ctx.beginPath();
-    ctx.lineWidth = 1;
+    ctx.lineWidth = 2;
     ctx.strokeStyle = 'rgba(217, 0, 7, 0.8)';
 
-    ctx.moveTo(0, height - data[0]);
     i = data.byteLength;
     while (i--) {
-        ctx.lineTo(i, height - data[i]);
-        // ctx.lineTo(i << 1, height - data[i]);
+        var x = (i / data.byteLength) * width;
+        var y = ((255 - data[i]) / 255) * (height * .34) + (height * .66);
+        if (i === data.byteLength - 1) {
+            ctx.moveTo(x, y);
+        }
+        else {
+            ctx.lineTo(x, y);
+        }
     }
     ctx.stroke();
     ctx.closePath();

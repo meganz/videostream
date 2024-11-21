@@ -275,7 +275,13 @@ function EBMLReader(file, offset) {
     this._trackDefaultDuration = 0;
     this._segment = Object.create(null);
 
-    this.$buffer = new Buffer(0x2000000);
+    try {
+        this.$buffer = new Buffer(0x2000000);
+    }
+    catch (ex) {
+        vsNT(this.emit.bind(this, 'error', ex));
+        return this;
+    }
     this.$head = 0;
 
     this._decoder = new EBMLDecoder();

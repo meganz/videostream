@@ -1,20 +1,23 @@
 var Buffer = require('buffer').Buffer;
 
-var cbs = [];
-var tbsp = Promise.resolve();
-var onNextTick = function(cb) {
+var onNextTick = (function() {
+    var cbs = [];
+    var dsp = function() {
+        var i = 0, q = cbs;
+        cbs = [];
+        // console.warn('xyz dsp', q.length, q);
+        while (i < q.length) {
+            q[i++]();
+        }
+    };
+
+    return function(cb) {
     // console.warn('xyz add', cbs.length, cb);
-    if (cbs.push(cb) === 1) {
-        tbsp.then(function() {
-            var q = cbs;
-            cbs = [];
-            // console.warn('xyz dsp', q.length, q);
-            for (var i = 0; i < q.length; ++i) {
-                q[i]();
-            }
-        });
-    }
-};
+        if (cbs.push(cb) === 1) {
+            queueMicrotask(dsp);
+        }
+    };
+})();
 Object.defineProperty(window, 'vsNT', {value: onNextTick});
 
 var utils = {

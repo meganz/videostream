@@ -101,14 +101,31 @@ VideoStream.prototype._createMuxer = function(opts) {
     });
 
     self._muxer.on('error', function(err) {
-        self._elemWrapper.error(err)
+        self.error(err);
     })
+};
+
+VideoStream.prototype.error = function(err) {
+    var ew = this._elemWrapper;
+    if (ew) {
+        var ms = ew._mediaSource;
+        var sb = ms && ms.sourceBuffers;
+        var cb = ew.error.bind(ew, err);
+
+        later(cb);
+        if (sb && sb.length) {
+            for (var i = sb.length; i--;) {
+                this.onSourceBufferUpdateEnded(sb[i], cb);
+            }
+        }
+    }
 };
 
 VideoStream.prototype.createWriteStream = function(obj) {
     var videoStream = this;
     var videoFile = videoStream._file;
     var mediaSource = videoStream._elemWrapper.createWriteStream(obj);
+    var csb = mediaSource._createSourceBuffer;
     var mediaSourceDestroy = mediaSource.destroy;
     var trace = !localStorage.vsd ? null : function(time, sb, chunk) {
         var start = time;
@@ -122,6 +139,16 @@ VideoStream.prototype.createWriteStream = function(obj) {
             b.join(', '), chunk.timecode, chunk.duration, time,
             start, sb.appendWindowStart, end, sb.appendWindowEnd,
             sb.timestampOffset, chunk.seektime);
+    };
+
+    mediaSource._createSourceBuffer = function() {
+        try {
+            return csb.apply(this, arguments);
+        }
+        catch (ex) {
+            ex = String(ex.message || ex);
+            vsNT(this.destroy.bind(this, ex));
+        }
     };
 
     mediaSource._write = function(chunk, encoding, cb) {
@@ -237,10 +264,7 @@ VideoStream.prototype.createWriteStream = function(obj) {
     };
 
     mediaSource.on('error', function(err) {
-        var elm = videoStream._elemWrapper;
-        if (elm) {
-            elm.error(err);
-        }
+        videoStream.error(err);
     });
 
     return mediaSource;
@@ -262,7 +286,7 @@ VideoStream.prototype._pump = function(time) {
         }
     }
     catch (ex) {
-        this._elemWrapper.error(ex);
+        this.error(ex);
     }
 };
 
@@ -338,7 +362,7 @@ VideoStream.prototype._tryPump = function(time) {
         if (!track.initFlushed) {
             track.onInitFlushed = function(err) {
                 if (err) {
-                    self._elemWrapper.error(err);
+                    self.error(err);
                     return
                 }
                 pumpTrack()
@@ -468,7 +492,13 @@ VideoStream.prototype._forcePump = function(offset) {
                 this.onSourceBufferUpdateEnded(sb, this.removeBuffered.bind(this, sb, null, pump));
             }
             else {
-                res |= this.removeBuffered(sb, null, pump);
+                try {
+                    res |= this.removeBuffered(sb, null, pump);
+                }
+                catch (ex) {
+                    --step;
+                    dump(ex);
+                }
             }
         }
     }
