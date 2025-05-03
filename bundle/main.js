@@ -492,17 +492,11 @@ VideoFile.prototype.fetch = function fetch(startpos, recycle) {
                 }
 
                 if (self.isOnline) {
-                    if (!xhr.status) {
-                        // retry immediately if e.g. error 0x2ef3 on MSIE...
-                        retry();
-                    }
-                    else {
-                        self.backoff = Math.min(self.backoff << 1, 7e3);
-                        setTimeout(retry, self.backoff);
+                    self.backoff = Math.min(self.backoff << 1, 7e3);
+                    setTimeout(retry, self.backoff);
 
-                        if (xhr.status === 403 && typeof self.data === 'object') {
-                            self.data = self.data._ticket || self.data;
-                        }
+                    if (xhr.status === 403 && typeof self.data === 'object') {
+                        self.data = self.data._ticket || self.data;
                     }
                 }
                 else {
