@@ -191,9 +191,10 @@ Megaify.prototype._transform = function(chunk, enc, cb) {
     if (this.filename.indexOf('/end-of-stream/index.js') > 0) {
         chunk = chunk.replace('isRequest(stream)', '0');
         chunk = chunk.replace('isChildProcess(stream)', '0');
+        chunk = chunk.replace('var qnt = ', 'if(0)x=');
         chunk = chunk.replace('var isRequest = ', 'if(0)x=');
         chunk = chunk.replace('var isChildProcess = ', 'if(0)x=');
-        chunk = chunk.replace('process.nextTick(onclosenexttick)', 'vsNT(onclosenexttick)');
+        chunk = chunk.replace('qnt(onclosenexttick)', 'vsNT(onclosenexttick)');
 
         // fixme: https://github.com/mafintosh/end-of-stream/issues/30
         chunk = chunk.replace('&& !rs.destroyed', '');

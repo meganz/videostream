@@ -228,7 +228,6 @@ VideoStream.prototype.createWriteStream = function(obj) {
                 console.debug('Caught exception ("%s")', ex.name, sb && sb.updating, sb, ex);
             }
 
-            if (sb && sb.updating) {
                 // This must have been an InvalidStateError invoking .abort()
                 // with pending .remove()s from the seeking event...
 
@@ -236,10 +235,6 @@ VideoStream.prototype.createWriteStream = function(obj) {
                     self.emit('error', err);
                 }
                 self.emit('close');
-            }
-            else {
-                throw ex;
-            }
         }
     };
 

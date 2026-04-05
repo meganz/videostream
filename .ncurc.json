@@ -1,7 +1,7 @@
 {
     "peer": true,
     "cache": true,
-    "format": "ownerChanged, time",
+    "format": "ownerChanged,time,diff",
     "reject": [
         "ebml",
         "uglify-js",

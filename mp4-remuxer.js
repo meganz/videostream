@@ -1041,6 +1041,22 @@ Box.boxes.AudioSampleEntry.decode = function(buf, offset, end) {
         ptr += child.length;
     }
 
+    if (!box.esds) {
+        for (var i = 0; i < length - 4; i++) {
+            // find esds in qt -- @todo: proper frma/wave parsers..
+            if (buf[i] === 0x65 && buf[i + 1] === 0x73 && buf[i + 2] === 0x64 && buf[i + 3] === 0x73) {
+                offset = i - 4;
+                end = (buf[offset] << 24 | buf[offset + 1] << 16 | buf[offset + 2] << 8 | buf[offset + 3]);
+                ptr = Box.boxes.esds.decode(buf, offset + 12, offset + end)
+                ptr.type = 'esds'
+                ptr.contentLen = ptr.buffer.length
+                box.children.push(ptr);
+                box.esds = ptr;
+                break;
+            }
+        }
+    }
+
     return box
 };
 
