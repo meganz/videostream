@@ -445,6 +445,128 @@ function assignTimestamps(samples, defaultDuration) {
 }
 
 /**
+ * Streaming decode-order timestamper.
+ *
+ * Matroska stores only presentation times; MP4 needs a decode time plus a
+ * composition offset. For a stream with B-frames the decode timeline is simply
+ * the presentation times sorted ascending -- the Nth frame in storage order
+ * takes the Nth smallest PTS.
+ *
+ * Doing that per cluster only works when a cluster holds whole reordering
+ * groups. Real files routinely break that: HEVC with B-pyramids reorders across
+ * 4-5 frames, and clusters can be shorter than that, so a group straddles the
+ * boundary. Sorting each cluster in isolation then yields fragments whose
+ * presentation ranges overlap and run backwards, which the browser turns into
+ * holes in its buffered range.
+ *
+ * So frames are held in a window instead: a frame's decode time is only fixed
+ * once enough later frames have arrived that no smaller presentation time can
+ * still turn up. That is boundary-agnostic by construction.
+ *
+ * @param {Number} depth frames to keep in hand; must exceed the reorder depth
+ * @param {Number} defaultDuration fallback for the final frame, in ticks
+ * @constructor
+ */
+function Reorderer(depth, defaultDuration) {
+    this.depth = depth > 0 ? depth : 0;
+    this.defaultDuration = defaultDuration;
+    this.queue = [];    // storage order, decode time not yet fixed
+    this.pool = [];     // their presentation times, ascending
+    this.ready = [];    // decode time fixed, duration still pending
+}
+
+/**
+ * Insert a presentation time into the ascending pool.
+ * @param {Number} pts presentation time in ticks
+ */
+Reorderer.prototype._insert = function(pts) {
+    var lo = 0;
+    var hi = this.pool.length;
+
+    while (lo < hi) {
+        var mid = (lo + hi) >> 1;
+
+        if (this.pool[mid] < pts) {
+            lo = mid + 1;
+        }
+        else {
+            hi = mid;
+        }
+    }
+
+    this.pool.splice(lo, 0, pts);
+};
+
+/**
+ * Fix decode times for everything the window no longer protects.
+ * @param {Boolean} all drain completely, ignoring the window
+ */
+Reorderer.prototype._drain = function(all) {
+    while (this.queue.length > (all ? 0 : this.depth)) {
+        var frame = this.queue.shift();
+
+        // Smallest presentation time still outstanding: that is this frame's
+        // slot on the decode timeline.
+        frame.dts = this.pool.shift();
+        frame.cts = frame.pts - frame.dts;
+        this.ready.push(frame);
+    }
+};
+
+/**
+ * Hand back frames whose duration is known.
+ * @param {Boolean} all include the tail, using defaultDuration for the last
+ * @returns {Array} frames with dts, cts and duration set
+ */
+Reorderer.prototype._take = function(all) {
+    // A frame's duration is the gap to the next decode time, so the tail has to
+    // wait for more input.
+    var count = all ? this.ready.length : this.ready.length - 1;
+
+    if (count < 1) {
+        return [];
+    }
+
+    var out = this.ready.splice(0, count);
+
+    for (var i = 0; i < out.length; i++) {
+        var next = i + 1 < out.length ? out[i + 1] : this.ready[0];
+
+        out[i].duration = next ? next.dts - out[i].dts : this.defaultDuration;
+
+        if (!(out[i].duration > 0)) {
+            out[i].duration = this.defaultDuration;
+        }
+    }
+
+    return out;
+};
+
+/**
+ * Feed a cluster's frames in.
+ * @param {Array} frames frames in storage order
+ * @returns {Array} frames now fully timestamped
+ */
+Reorderer.prototype.push = function(frames) {
+    for (var i = 0; i < frames.length; i++) {
+        this.queue.push(frames[i]);
+        this._insert(frames[i].pts);
+    }
+
+    this._drain(false);
+    return this._take(false);
+};
+
+/**
+ * Empty the window, e.g. at end of stream or before a resync discontinuity.
+ * @returns {Array} every remaining frame, fully timestamped
+ */
+Reorderer.prototype.flush = function() {
+    this._drain(true);
+    return this._take(true);
+};
+
+/**
  * Build a moof+mdat media segment.
  * @param {Object} track internal track descriptor
  * @param {Array} samples timestamped samples for this fragment
@@ -508,6 +630,7 @@ function buildMediaSegment(track, samples) {
 }
 
 module.exports = {
+    Reorderer: Reorderer,
     lookupCodec: lookupCodec,
     codecString: codecString,
     buildInitSegment: buildInitSegment,

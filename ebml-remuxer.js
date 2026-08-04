@@ -14,6 +14,11 @@ module.exports = EBMLRemuxer;
 // step with the MP4 path rather than diverging for no gain.
 var MIN_FRAGMENT_DURATION = 1;
 
+// Video frames kept in hand before their decode time is fixed. Must exceed the
+// stream's reorder depth: H.264 typically needs 2-3, HEVC B-pyramids 4-5.
+// Comfortably above both, and the cost is only a little latency at startup.
+var REORDER_DEPTH = 16;
+
 
 var DEBUG = localStorage.vsd | 0;
 var DEBUG_INFO = DEBUG || window.d;
@@ -564,6 +569,8 @@ EBMLRemuxer.prototype._openClusterReader = function(offset, streams) {
     var endOfStream = function() {
         for (var i = streams.length; i--;) {
             if (!streams[i].destroyed) {
+                // Let out whatever the reorder window is still holding.
+                streams[i].flush();
                 streams[i].push(null);
                 streams[i].destroy();
             }
@@ -611,6 +618,13 @@ EBMLRemuxer.prototype._openClusterReader = function(offset, streams) {
             if (DEBUG_INFO) {
                 console.warn('Recovering from "%s" at %s; resuming at %s.', err && err.message, from, next);
             }
+            // Frames still held for reordering belong before the discontinuity,
+            // so let them out now rather than ordering them against what comes
+            // after the gap.
+            for (var s = 0; s < streams.length; s++) {
+                streams[s].flush();
+            }
+
             // Whatever sat between here and there is gone; measure the hole off
             // the first cluster that arrives so playback can run straight over it.
             self._resyncGap = true;
@@ -1223,6 +1237,15 @@ function Fmp4Segment(muxer, track) {
     // measure the hole against the file's own timeline.
     this.lastRawEnd = null;
 
+    // Decode times are fixed across cluster boundaries rather than within them;
+    // see Reorderer. Audio never reorders, so it needs no window.
+    this.reorder = new mkv.Reorderer(track.type === 1 ? REORDER_DEPTH : 0, track.defaultDuration);
+
+    // Timestamped frames waiting to make up a whole fragment. Emitting one per
+    // cluster is no good when clusters are short: fragments then span less than
+    // a reordering group, so consecutive ones overlap in presentation time and
+    // the browser tears its buffered range at every boundary.
+    this.buffer = [];
 }
 
 createStream(Fmp4Segment, stream.PassThrough, function() {
@@ -1234,17 +1257,37 @@ createStream(Fmp4Segment, stream.PassThrough, function() {
  * @param {Array} [frames] frames belonging to this track
  */
 Fmp4Segment.prototype.appendFrames = function(frames) {
+    if (this.destroyed) {
+        return;
+    }
+
+    // Decode times are fixed by a window spanning cluster boundaries, so what
+    // comes back is not this cluster's frames but whichever earlier ones the
+    // window has now released.
+    this.emitFrames(this.reorder.push(frames || []));
+};
+
+/**
+ * Release everything still held for reordering -- at end of stream, or before a
+ * resync discontinuity makes the held frames meaningless.
+ */
+Fmp4Segment.prototype.flush = function() {
+    if (!this.destroyed) {
+        this.emitFrames(this.reorder.flush());
+        this.drainFragments(true);
+    }
+};
+
+/**
+ * Emit fully timestamped frames as one or more fMP4 fragments.
+ * @param {Array} frames frames with dts, cts and duration set
+ */
+Fmp4Segment.prototype.emitFrames = function(frames) {
     if (this.destroyed || !frames || !frames.length) {
         return;
     }
 
     var track = this.track;
-
-    // Timestamps have to be assigned over the whole cluster: it is one
-    // self-contained reordering group, so splitting first would corrupt the
-    // derived decode order.
-    mkv.assignTimestamps(frames, track.defaultDuration);
-
     var tail = frames[frames.length - 1];
     this.lastRawEnd = tail.dts + tail.duration;
 
@@ -1264,31 +1307,44 @@ Fmp4Segment.prototype.appendFrames = function(frames) {
             frames[0].dts, frames[frames.length - 1].dts);
     }
 
-    // Emit in sub-second fragments rather than one per cluster. Clusters can run
-    // to several seconds and a couple of megabytes, and nothing plays until a
-    // whole fragment has arrived -- which stalls playback at the start and after
-    // every seek. MP4Remuxer caps fragments the same way.
+    this.buffer = this.buffer.length ? this.buffer.concat(frames) : frames;
+    this.drainFragments(false);
+};
+
+/**
+ * Cut whole fragments off the front of the buffer.
+ * @param {Boolean} all also emit the remainder, however short
+ */
+Fmp4Segment.prototype.drainFragments = function(all) {
+    var track = this.track;
+    var buffer = this.buffer;
     var limit = MIN_FRAGMENT_DURATION * track.timescale;
     var from = 0;
 
-    for (var i = 0; i < frames.length; i++) {
-        // Only ever break at a sync sample, exactly as mp4-remuxer.js does.
-        // Splitting mid-GOP would start a fragment on a B-frame whose negative
-        // composition offset places its presentation time before the end of the
-        // previous fragment, and MSE handles that overlap badly. Audio frames
-        // are all sync samples, so they split freely.
-        if (frames[i].keyframe && i > from && frames[i].dts - frames[from].dts >= limit) {
+    for (var i = 1; i < buffer.length; i++) {
+        // Break only at a sync sample, exactly as mp4-remuxer.js does: starting
+        // a fragment mid-GOP puts a B-frame first, whose negative composition
+        // offset precedes the previous fragment's end. Audio has no such
+        // constraint, and not every audio block flags itself as a sync sample.
+        if (track.type === 1 && !buffer[i].keyframe) {
+            continue;
+        }
+
+        if (buffer[i].dts - buffer[from].dts >= limit) {
             // NB: deliberately no `duration` property on the pushed buffer --
             // that is the passthrough path's signal for videostream.js to start
             // juggling sb.timestampOffset, which fMP4 must not do since tfdt is
             // absolute.
-            this.push(mkv.buildMediaSegment(track, frames.slice(from, i)));
+            this.push(mkv.buildMediaSegment(track, buffer.slice(from, i)));
             from = i;
         }
     }
 
-    if (from < frames.length) {
-        this.push(mkv.buildMediaSegment(track, frames.slice(from)));
+    this.buffer = buffer.slice(from);
+
+    if (all && this.buffer.length) {
+        this.push(mkv.buildMediaSegment(track, this.buffer));
+        this.buffer = [];
     }
 };
 

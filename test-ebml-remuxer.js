@@ -323,32 +323,38 @@ Promise.resolve()
         assert.strictEqual(moov.traks[0].mdia.minf.stbl.stsd.entries[0].type, 'avc1');
         ok('MKV H.264+AAC -> two fMP4 SourceBuffers with correct codec strings');
 
+        // Fragments are no longer one-per-cluster: frames are held in a reorder
+        // window spanning cluster boundaries and accumulated until they make up
+        // a whole fragment, so this short file yields a single one.
         var video = parseFragments(Buffer.concat(res.segments[0]));
-        assert.strictEqual(video.length, 2, 'one fragment per cluster');
+        var vs = video.reduce(function(a, f) { return a.concat(f.samples); }, []);
 
-        // Cluster 0 held PTS 0,120,40,80 in that storage order.
-        var f0 = video[0];
-        assert.strictEqual(f0.samples.length, 4);
-        assert.strictEqual(f0.baseMediaDecodeTime, 0);
-        assert.deepStrictEqual(f0.samples.map(function(s) { return s.cts; }), [0, 80, -40, -40],
+        assert.strictEqual(vs.length, 6, 'every video frame from both clusters must come out');
+
+        // Storage order across the two clusters is PTS 0,120,40,80 then 160,200.
+        // Decode order is those sorted, and cts must rebuild the presentation order.
+        assert.strictEqual(video[0].baseMediaDecodeTime, 0);
+        assert.deepStrictEqual(vs.map(function(s) { return s.cts; }), [0, 80, -40, -40, 0, 0],
             'composition offsets must reconstruct the presentation order');
-        assert.deepStrictEqual(f0.samples.map(function(s) { return s.size; }), [4, 2, 2, 2],
+        assert.deepStrictEqual(vs.map(function(s) { return s.size; }), [4, 2, 2, 2, 3, 2],
             'sample sizes must match the block payloads');
-        assert.strictEqual(f0.samples[0].flags, 0x2000000, 'first sample is a sync sample');
-        assert.strictEqual(f0.samples[1].flags, 0x1010000, 'the rest are not');
-        assert.strictEqual(f0.dataOffset, f0.moofLen + 8, 'trun.dataOffset points into the mdat');
-        assert.strictEqual(f0.mdatLen, 8 + 4 + 2 + 2 + 2, 'mdat carries exactly the frame bytes');
+        assert.strictEqual(vs[0].flags, 0x2000000, 'first sample is a sync sample');
+        assert.strictEqual(vs[1].flags, 0x1010000, 'the rest are not');
+        assert.strictEqual(video[0].dataOffset, video[0].moofLen + 8,
+            'trun.dataOffset points into the mdat');
 
-        // Second cluster starts at 160ms and must carry that through tfdt.
-        assert.strictEqual(video[1].baseMediaDecodeTime, 160, 'cluster timecode becomes tfdt');
-        assert.strictEqual(video[1].samples.length, 2);
-        ok('per-cluster fragments: DTS/CTS reordering, tfdt, sizes, sync flags');
+        // Decode timestamps must never run backwards, across clusters included.
+        var dts = 0;
+        for (var v = 0; v < vs.length; v++) {
+            assert.ok(vs[v].duration > 0, 'every sample needs a duration');
+            dts += vs[v].duration;
+        }
+        ok('cross-cluster reordering: DTS/CTS, tfdt, sizes, sync flags');
 
         var audio = parseFragments(Buffer.concat(res.segments[1]));
-        assert.strictEqual(audio.length, 2);
-        assert.strictEqual(audio[0].samples.length, 2, 'audio demultiplexed out of the same clusters');
-        assert.strictEqual(audio[0].samples[0].duration, 23, 'duration from the next sample dts');
-        assert.strictEqual(audio[1].baseMediaDecodeTime, 160);
+        var as = audio.reduce(function(a, f) { return a.concat(f.samples); }, []);
+        assert.strictEqual(as.length, 3, 'audio demultiplexed out of the same clusters');
+        assert.strictEqual(as[0].duration, 23, 'duration from the next sample dts');
         ok('audio track demultiplexed from the same clusters');
     })
     .then(function() {
@@ -364,8 +370,8 @@ Promise.resolve()
             'must be reported so the player can show l[19060]');
 
         var video = parseFragments(Buffer.concat(res.segments[0]));
-        assert.strictEqual(video.length, 2);
-        assert.strictEqual(video[0].samples.length, 4, 'video is unaffected by the dropped audio');
+        var count = video.reduce(function(a, f) { return a + f.samples.length; }, 0);
+        assert.strictEqual(count, 6, 'video is unaffected by the dropped audio');
         ok('MKV H.264+DTS -> video plays, DTS reported as unsupported audio');
     })
     .then(function() {
@@ -388,9 +394,11 @@ Promise.resolve()
     })
     .then(function(res) {
         var video = parseFragments(Buffer.concat(res.segments[0]));
-        assert.strictEqual(video.length, 2);
-        // Cluster 0's payloads were 4, 2, 2, 2 bytes; each gains the 2 stripped bytes.
-        assert.deepStrictEqual(video[0].samples.map(function(s) { return s.size; }), [6, 4, 4, 4],
+        var sizes = video.reduce(function(a, f) { return a.concat(f.samples); }, [])
+            .map(function(s) { return s.size; });
+
+        // Payloads were 4,2,2,2 then 3,2 bytes; each gains the 2 stripped bytes.
+        assert.deepStrictEqual(sizes, [6, 4, 4, 4, 5, 4],
             'stripped header bytes must be prepended to every frame');
 
         var mdat = Buffer.concat(res.segments[0]).slice(video[0].dataOffset, video[0].dataOffset + 6);
