@@ -1,0 +1,517 @@
+'use strict';
+
+/**
+ * Matroska -> fragmented-MP4 helpers.
+ *
+ * The EBML remuxer historically piped raw Matroska bytes straight into a
+ * `video/webm` SourceBuffer, which only works when the file is effectively a
+ * WebM (VP8/VP9/AV1 + Vorbis/Opus). Everything else -- most notably H.264 and
+ * HEVC, which is what the overwhelming majority of .mkv files carry -- had no
+ * playback path at all.
+ *
+ * This module turns parsed Matroska tracks/frames into an ISO-BMFF init
+ * segment (ftyp+moov) and per-cluster media segments (moof+mdat), which MSE
+ * accepts on every browser we support. It deliberately reuses the
+ * `mp4-box-encoding` boxes that mp4-remuxer.js already registers (avcC, hvcC,
+ * VisualSampleEntry aliases for hvc1/hev1, ...) so no new vendor code is
+ * pulled in.
+ */
+
+var Box = require('mp4-box-encoding');
+var Buffer = require('buffer').Buffer;
+var tools = require('ebml/lib/ebml/tools');
+
+/**
+ * Video CodecIDs we can wrap into fMP4.
+ * Matroska stores H.264/HEVC in the very same AVCC length-prefixed form MP4
+ * uses, and CodecPrivate *is* the decoder configuration record -- so both the
+ * sample data and the config box are straight byte copies, no conversion.
+ */
+var VIDEO_CODECS = {
+    'V_MPEG4/ISO/AVC': {entry: 'avc1', config: 'avcC'},
+    // Not a typo: 'IS0' with a digit zero is what some muxers wrote, and
+    // MediaInfo (plus MEGA's codec list) carries entries for both spellings.
+    'V_MPEG4/IS0/AVC': {entry: 'avc1', config: 'avcC'},
+    'V_MPEGH/ISO/HEVC': {entry: 'hvc1', config: 'hvcC'}
+};
+
+/**
+ * Audio CodecIDs we can wrap into fMP4. Anything absent here is reported
+ * through `unsupportedAudio` so the player drops the track and plays the video
+ * silently (see l[19060] "Unsupported audio codec (%1)"), which is what
+ * happens for DTS, AC-3, E-AC-3, TrueHD and friends -- no browser can decode
+ * those through MSE.
+ */
+var AUDIO_CODECS = {
+    'A_AAC': {entry: 'mp4a', oti: 0x40},
+    'A_MPEG/L3': {entry: 'mp4a', oti: 0x6b},
+    'A_MPEG/L2': {entry: 'mp4a', oti: 0x69},
+    'A_FLAC': {entry: 'fLaC', config: 'dfLa'},
+    'A_OPUS': {entry: 'Opus', config: 'dOps'}
+};
+
+var SELF_CONTAINED_DREF = {
+    entries: [{type: 'url ', buf: Buffer.from([0, 0, 0, 1])}]
+};
+
+// mp4-box-encoding only knows avc1/mp4a. mp4-remuxer.js registers hvc1/hev1
+// and the hvcC codec, but relying on it having been loaded first is an
+// implicit load-order dependency -- so claim the aliases we need ourselves.
+// All of these are idempotent, and Box.encode() throws on an unknown type.
+Box.boxes.hvc1 = Box.boxes.hvc1 || Box.boxes.VisualSampleEntry;
+Box.boxes.hev1 = Box.boxes.hev1 || Box.boxes.VisualSampleEntry;
+Box.boxes.fLaC = Box.boxes.fLaC || Box.boxes.AudioSampleEntry;
+Box.boxes.Opus = Box.boxes.Opus || Box.boxes.AudioSampleEntry;
+
+/**
+ * Resolve a Matroska CodecID to its fMP4 mapping.
+ * @param {String} codecId raw TrackEntry.CodecID
+ * @param {Number} type TrackType (1 video, 2 audio)
+ * @returns {Object|undefined} mapping entry, if we can carry it
+ */
+function lookupCodec(codecId, type) {
+    codecId = String(codecId);
+
+    if (type === 1) {
+        return VIDEO_CODECS[codecId];
+    }
+
+    // Older muxers write A_AAC/MPEG4/LC, A_AAC/MPEG2/LC/SBR and so forth.
+    var key = codecId.indexOf('A_AAC') === 0 ? 'A_AAC' : codecId;
+    return AUDIO_CODECS[key];
+}
+
+/**
+ * Derive the RFC 6381 codec string MSE needs for this track.
+ *
+ * For H.264/HEVC we hand CodecPrivate to the very same avcC/hvcC decoders
+ * mp4-remuxer.js uses, so an MKV and an MP4 carrying identical video end up
+ * advertising an identical codec string.
+ *
+ * @param {Object} track internal track descriptor
+ * @returns {String} e.g. 'avc1.640029', 'hvc1.1.6.L93.90', 'mp4a.40.2'
+ */
+function codecString(track) {
+    var map = track.map;
+    var priv = track.codecPrivate;
+
+    if (track.type === 1) {
+        var box = Box.boxes[map.config];
+
+        if (box && priv && priv.length > 3) {
+            try {
+                var info = box.decode(priv, 0, priv.length);
+
+                // avcC yields the bare '640029' hex triplet, hvcC a leading-dot
+                // '.1.6.L93.90' -- match how mp4-remuxer.js concatenates each.
+                if (map.config === 'avcC') {
+                    return map.entry + '.' + info.mimeCodec;
+                }
+                return map.entry + info.mimeCodec;
+            }
+            catch (ex) {
+                // A truncated or malformed configuration record must not take
+                // the whole file down: fall through to the bare entry name,
+                // which isTypeSupported() will almost certainly reject, and the
+                // track gets skipped cleanly.
+                if (window.d) {
+                    console.warn('Malformed %s, ignoring track.', map.config, ex);
+                }
+            }
+        }
+        return map.entry;
+    }
+
+    if (map.oti === 0x40) {
+        // AudioSpecificConfig: the top 5 bits are the audio object type.
+        var aot = priv && priv.length ? priv[0] >> 3 : 0;
+        return 'mp4a.40.' + (aot > 0 && aot < 31 ? aot : 2);
+    }
+    if (map.oti) {
+        return 'mp3';
+    }
+    return map.entry === 'fLaC' ? 'flac' : 'opus';
+}
+
+/**
+ * Encode an MPEG-4 descriptor length using the expandable format.
+ * @param {Number} len byte length being described
+ * @returns {Array} big-endian length bytes
+ */
+function descriptorLength(len) {
+    if (len < 0x80) {
+        return [len];
+    }
+    return [
+        0x80 | (len >> 21 & 0x7f),
+        0x80 | (len >> 14 & 0x7f),
+        0x80 | (len >> 7 & 0x7f),
+        len & 0x7f
+    ];
+}
+
+/**
+ * Wrap a payload in an MPEG-4 descriptor.
+ * @param {Number} tag descriptor tag
+ * @param {Array} payload descriptor body bytes
+ * @returns {Array} tag + length + body
+ */
+function descriptor(tag, payload) {
+    return [tag].concat(descriptorLength(payload.length), payload);
+}
+
+/**
+ * Build the body of an `esds` box for a track.
+ *
+ * `esds` is registered as a full box, so mp4-box-encoding writes the
+ * version/flags word itself and copies `buffer` verbatim after it -- meaning
+ * this must return the bare ES_Descriptor.
+ *
+ * @param {Number} oti objectTypeIndication (0x40 AAC, 0x6b MP3, ...)
+ * @param {Buffer} [asc] DecoderSpecificInfo, i.e. Matroska CodecPrivate
+ * @returns {Buffer} ES_Descriptor bytes
+ */
+function buildEsds(oti, asc) {
+    // DecoderConfigDescriptor: oti, streamType(audio=5)<<2|upStream<<1|reserved,
+    // bufferSizeDB (3B), maxBitrate (4B), avgBitrate (4B). Bitrates are
+    // advisory; zero is accepted everywhere and avoids lying about the stream.
+    var dcd = [oti, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    if (asc && asc.length) {
+        dcd = dcd.concat(descriptor(0x05, Array.prototype.slice.call(asc)));
+    }
+
+    var esd = [0, 0, 0]
+        .concat(descriptor(0x04, dcd))
+        .concat(descriptor(0x06, [0x02]));
+
+    return Buffer.from(descriptor(0x03, esd));
+}
+
+/**
+ * Build the sample entry (stsd child) describing a track.
+ * @param {Object} track internal track descriptor
+ * @returns {Object} mp4-box-encoding box
+ */
+function buildSampleEntry(track) {
+    var map = track.map;
+    var priv = track.codecPrivate;
+    var entry = {
+        type: map.entry,
+        dataReferenceIndex: 1,
+        children: []
+    };
+
+    if (track.type === 1) {
+        entry.width = track.width;
+        entry.height = track.height;
+        entry.children.push({type: map.config, buffer: priv});
+    }
+    else {
+        entry.channelCount = track.channels;
+        entry.sampleSize = track.bitDepth || 16;
+        // AudioSampleEntry writes this as a raw uint32, but the field is 16.16
+        // fixed point -- so it has to be pre-scaled. Multiplication, not `<<`:
+        // 44100 << 16 overflows JS's signed 32-bit bitwise range.
+        entry.sampleRate = (track.sampleRate | 0) * 0x10000;
+
+        if (map.oti) {
+            entry.children.push({type: 'esds', buffer: buildEsds(map.oti, priv)});
+        }
+        else if (map.config && priv) {
+            entry.children.push({type: map.config, buffer: priv});
+        }
+    }
+
+    return entry;
+}
+
+/**
+ * Build the ftyp+moov initialisation segment for a single track.
+ * @param {Object} track internal track descriptor
+ * @returns {Buffer} init segment
+ */
+function buildInitSegment(track) {
+    var isVideo = track.type === 1;
+
+    var ftyp = Box.encode({
+        type: 'ftyp',
+        brand: 'iso5',
+        brandVersion: 0,
+        compatibleBrands: ['iso5', 'iso6', 'mp41']
+    });
+
+    var moov = Box.encode({
+        type: 'moov',
+        mvhd: {
+            timeScale: track.timescale,
+            duration: 0,
+            nextTrackId: 2
+        },
+        traks: [{
+            tkhd: {
+                flags: 3, // track enabled | in movie
+                trackId: track.trackId,
+                duration: 0,
+                volume: isVideo ? 0 : 0x100,
+                trackWidth: (track.width | 0) * 0x10000,
+                trackHeight: (track.height | 0) * 0x10000
+            },
+            mdia: {
+                mdhd: {
+                    timeScale: track.timescale,
+                    duration: 0,
+                    language: track.language
+                },
+                hdlr: {
+                    handlerType: isVideo ? 'vide' : 'soun',
+                    name: isVideo ? 'VideoHandler' : 'SoundHandler'
+                },
+                minf: {
+                    vmhd: isVideo ? {graphicsMode: 0, opcolor: [0, 0, 0]} : undefined,
+                    smhd: isVideo ? undefined : {balance: 0},
+                    dinf: {dref: SELF_CONTAINED_DREF},
+                    stbl: {
+                        stsd: {entries: [buildSampleEntry(track)]},
+                        stts: emptyTable(),
+                        ctts: emptyTable(),
+                        stsc: emptyTable(),
+                        stsz: emptyTable(),
+                        stco: emptyTable(),
+                        stss: emptyTable()
+                    }
+                }
+            }
+        }],
+        mvex: {
+            mehd: {fragmentDuration: 0},
+            trexs: [{
+                trackId: track.trackId,
+                defaultSampleDescriptionIndex: 1,
+                defaultSampleDuration: 0,
+                defaultSampleSize: 0,
+                defaultSampleFlags: 0
+            }]
+        }
+    });
+
+    return Buffer.concat([ftyp, moov]);
+}
+
+function emptyTable() {
+    return {version: 0, flags: 0, entries: []};
+}
+
+/**
+ * Split a Matroska Block/SimpleBlock into its constituent frames.
+ *
+ * Lacing matters here: video effectively never uses it, but AAC and MP3 audio
+ * in Matroska routinely pack several frames into one block.
+ *
+ * @param {Buffer} data raw block payload
+ * @param {Boolean} simple true for SimpleBlock (carries the keyframe flag)
+ * @returns {Object|false} {trackNumber, timecode, keyframe, frames}
+ */
+function parseBlock(data, simple) {
+    var vint = tools.readVint(data, 0);
+    if (!vint) {
+        return false;
+    }
+
+    var p = vint.length;
+    if (data.length < p + 3) {
+        return false;
+    }
+
+    var trackNumber = vint.value;
+    var timecode = data.readInt16BE(p);
+    var flags = data.readUInt8(p + 2);
+    p += 3;
+
+    var lacing = (flags & 0x06) >> 1;
+    var frames = [];
+
+    if (lacing === 0) {
+        frames.push(data.slice(p));
+    }
+    else {
+        var count = data.readUInt8(p++) + 1;
+        var sizes = [];
+        var i;
+
+        if (lacing === 2) {
+            // Fixed-size lacing: the remainder divides evenly.
+            var each = (data.length - p) / count;
+            for (i = 0; i < count - 1; i++) {
+                sizes.push(each);
+            }
+        }
+        else if (lacing === 1) {
+            // Xiph lacing: sizes as runs of 0xff terminated by a shorter byte.
+            for (i = 0; i < count - 1; i++) {
+                var size = 0;
+                var byte;
+                do {
+                    byte = data.readUInt8(p++);
+                    size += byte;
+                }
+                while (byte === 0xff);
+                sizes.push(size);
+            }
+        }
+        else {
+            // EBML lacing: first size is an unsigned vint, the rest are signed
+            // deltas against the previous size.
+            var first = tools.readVint(data, p);
+            p += first.length;
+            sizes.push(first.value);
+
+            for (i = 1; i < count - 1; i++) {
+                var delta = tools.readVint(data, p);
+                p += delta.length;
+                // Undo the signed-vint bias: 2^(7*len - 1) - 1
+                sizes.push(sizes[i - 1] + (delta.value - (Math.pow(2, 7 * delta.length - 1) - 1)));
+            }
+        }
+
+        for (i = 0; i < sizes.length; i++) {
+            frames.push(data.slice(p, p + sizes[i]));
+            p += sizes[i];
+        }
+        frames.push(data.slice(p));
+    }
+
+    return {
+        trackNumber: trackNumber,
+        timecode: timecode,
+        // A plain Block carries no keyframe bit; BlockGroup/ReferenceBlock
+        // decides, and the reader fills that in afterwards.
+        keyframe: simple ? !!(flags & 0x80) : true,
+        frames: frames
+    };
+}
+
+/**
+ * Assign decode timestamps to a cluster's samples.
+ *
+ * Matroska only stores presentation timestamps. MP4 needs a decode timestamp
+ * plus a composition offset, and for H.264/HEVC with B-frames the two differ.
+ * Because a Matroska cluster starts on a keyframe and therefore holds a
+ * self-contained reordering group, the decode order is simply the presentation
+ * timestamps sorted ascending -- no SPS parsing or sliding window required.
+ *
+ * @param {Array} samples samples in decode (storage) order, each with a `pts`
+ * @param {Number} defaultDuration fallback duration for the final sample
+ */
+function assignTimestamps(samples, defaultDuration) {
+    var i;
+    var reordered = false;
+
+    for (i = 1; i < samples.length; i++) {
+        if (samples[i].pts < samples[i - 1].pts) {
+            reordered = true;
+            break;
+        }
+    }
+
+    if (reordered) {
+        var sorted = samples.map(function(s) {
+            return s.pts;
+        }).sort(function(a, b) {
+            return a - b;
+        });
+
+        for (i = 0; i < samples.length; i++) {
+            samples[i].dts = sorted[i];
+            samples[i].cts = samples[i].pts - sorted[i];
+        }
+    }
+    else {
+        for (i = 0; i < samples.length; i++) {
+            samples[i].dts = samples[i].pts;
+            samples[i].cts = 0;
+        }
+    }
+
+    for (i = 0; i < samples.length; i++) {
+        samples[i].duration = i + 1 < samples.length
+            ? samples[i + 1].dts - samples[i].dts
+            : defaultDuration;
+
+        if (!(samples[i].duration > 0)) {
+            samples[i].duration = defaultDuration;
+        }
+    }
+}
+
+/**
+ * Build a moof+mdat media segment.
+ * @param {Object} track internal track descriptor
+ * @param {Array} samples timestamped samples for this fragment
+ * @returns {Buffer} media segment
+ */
+function buildMediaSegment(track, samples) {
+    var entries = [];
+    var payload = [];
+    var trunVersion = 0;
+    var total = 0;
+    var i;
+
+    for (i = 0; i < samples.length; i++) {
+        var sample = samples[i];
+
+        if (sample.cts < 0) {
+            trunVersion = 1;
+        }
+
+        entries.push({
+            sampleDuration: sample.duration,
+            sampleSize: sample.data.length,
+            sampleFlags: sample.keyframe ? 0x2000000 : 0x1010000,
+            sampleCompositionTimeOffset: sample.cts
+        });
+
+        payload.push(sample.data);
+        total += sample.data.length;
+    }
+
+    var moof = {
+        type: 'moof',
+        mfhd: {sequenceNumber: track.sequence++},
+        trafs: [{
+            tfhd: {
+                flags: 0x20000, // default-base-is-moof
+                trackId: track.trackId
+            },
+            // NB: mp4-box-encoding's tfdt is 32-bit only (no version 1), so
+            // baseMediaDecodeTime must stay inside 2^32. At the millisecond
+            // timescale Matroska gives us that is ~49 days of media.
+            tfdt: {
+                baseMediaDecodeTime: samples[0].dts
+            },
+            trun: {
+                flags: 0xf01,
+                dataOffset: 8, // patched below once the moof size is known
+                entries: entries,
+                version: trunVersion
+            }
+        }]
+    };
+
+    moof.trafs[0].trun.dataOffset += Box.encodingLength(moof);
+
+    var mdat = Buffer.allocUnsafe(8);
+    mdat.writeUInt32BE(total + 8, 0);
+    mdat.write('mdat', 4, 4, 'ascii');
+
+    return Buffer.concat([Box.encode(moof), mdat].concat(payload));
+}
+
+module.exports = {
+    lookupCodec: lookupCodec,
+    codecString: codecString,
+    buildInitSegment: buildInitSegment,
+    buildMediaSegment: buildMediaSegment,
+    assignTimestamps: assignTimestamps,
+    parseBlock: parseBlock
+};

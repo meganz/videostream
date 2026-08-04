@@ -5,8 +5,15 @@ var Buffer = require('buffer').Buffer;
 var stream = require('readable-stream');
 var EventEmitter = require('events').EventEmitter;
 var EBMLDecoder = require('ebml/lib/ebml/decoder');
+var mkv = require('./mkv-fmp4');
 
 module.exports = EBMLRemuxer;
+
+// Seconds of media per fMP4 fragment; mirrors mp4-remuxer.js. Halving it was
+// tried to cut time-to-first-frame and measurably did not help, so it stays in
+// step with the MP4 path rather than diverging for no gain.
+var MIN_FRAGMENT_DURATION = 1;
+
 
 var DEBUG = localStorage.vsd | 0;
 var DEBUG_INFO = DEBUG || window.d;
@@ -40,14 +47,44 @@ function EBMLRemuxer(file) {
     this._seekTable = false;
     this._seekTimeFixup = -1;
     this._initSegment = false;
+    this._hasUnsupportedAudio = false;
+
+    // Set once we fall out of the raw-EBML passthrough and start remuxing into
+    // fragmented MP4; see _setupFmp4().
+    this._fmp4 = false;
+    this._trackMap = null;
+    this._clusterReader = null;
+
+    // Media skipped by a resync leaves a hole the browser stalls on forever, so
+    // everything after it is pulled back over the hole. Holes are stored as
+    // file-time ranges rather than a running total: seeking makes us re-read the
+    // same damaged region, and a running total would count it again every time,
+    // shrinking the timeline further on each pass.
+    this._skipped = [];
+    this._timescale = 1000;
+    this._resyncGap = false;
 
     this._createReader(0, 'segment', function(segment) {
         this.destroy();
-        self.setInitSegment(segment);
+
+        // The reader is already gone by this point, so its own error plumbing
+        // can no longer carry anything thrown in here -- it would be swallowed
+        // and the muxer would just hang. Hand failures to the muxer directly.
+        try {
+            self.setInitSegment(segment);
+        }
+        catch (ex) {
+            self.destroy(ex);
+        }
     });
 }
 
-createStream(EBMLRemuxer, EventEmitter);
+createStream(EBMLRemuxer, EventEmitter, function() {
+    if (this._clusterReader) {
+        this._clusterReader.destroy();
+        this._clusterReader = null;
+    }
+});
 
 EBMLRemuxer.prototype.emitInitSegment = function(segment) {
     var tracks = segment.Tracks;
@@ -60,6 +97,231 @@ EBMLRemuxer.prototype.emitInitSegment = function(segment) {
         return this.destroy(new Error('Unsupported media format.'));
     }
 
+    // Prefer the historic raw-EBML passthrough whenever the file really is a
+    // WebM in a .mkv wrapper -- it is battle-tested and skips remuxing
+    // entirely, so files that play today keep taking the exact same path.
+    var data = this._setupPassthrough(tracks, segment) || this._setupFmp4(tracks, segment);
+
+    if (!data) {
+        return this.destroy(new Error('no playable tracks'));
+    }
+
+    this._buildSeekTable(segment);
+    this._initSegment = segment;
+    this.emit('ready', data);
+};
+
+/**
+ * Build the fragmented-MP4 track set for containers the passthrough can't take
+ * (H.264/HEVC video, AAC/MP3/FLAC audio, ...).
+ *
+ * Audio codecs no browser can decode through MSE -- DTS, AC-3, E-AC-3, TrueHD
+ * -- deliberately fall through to `_hasUnsupportedAudio`, so the video still
+ * plays and the player shows l[19060] "Unsupported audio codec (%1)".
+ *
+ * @param {Array} tracks TrackEntry list
+ * @param {Object} segment parsed init segment
+ * @returns {Array|false} per-track {mime, init}, or false if nothing is playable
+ */
+EBMLRemuxer.prototype._setupFmp4 = function(tracks, segment) {
+    var self = this;
+    var scale = segment.timecodeScale;
+    var timescale = Math.round(1e9 / scale);
+    var data = [];
+
+    self._timescale = timescale;
+
+    self._trackMap = Object.create(null);
+
+    for (var i = 0; i < tracks.length; i++) {
+        var entry = tracks[i];
+        var type = entry.TrackType;
+
+        if (type === 1 ? self._hasVideo : !(type === 2) || self._hasAudio) {
+            continue;
+        }
+
+        var codecId = String(entry.CodecID);
+        var map = mkv.lookupCodec(codecId, type);
+
+        if (!map) {
+            if (DEBUG_INFO) {
+                console.debug('Track%s: cannot carry %s in fMP4.', entry.TrackNumber, codecId);
+            }
+            if (type === 2) {
+                self._hasUnsupportedAudio = codecId;
+            }
+            continue;
+        }
+
+        var encoding = readContentEncoding(entry);
+
+        if (encoding === false) {
+            // zlib/bzip/lzo compression or encryption -- we cannot undo it, and
+            // emitting the raw frames would just feed the decoder garbage.
+            if (DEBUG_INFO) {
+                console.debug('Track%s: unsupported content encoding.', entry.TrackNumber);
+            }
+            if (type === 2) {
+                self._hasUnsupportedAudio = codecId;
+            }
+            continue;
+        }
+
+        var video = entry.Video || false;
+        var audio = entry.Audio || false;
+        var rate = Math.round(audio.SamplingFrequency || 48000);
+        var track = {
+            map: map,
+            type: type,
+            sequence: 1,
+            timescale: timescale,
+            language: 0x55c4, // 'und'
+            number: entry.TrackNumber,
+            trackId: data.length + 1,
+            codecPrivate: entry.CodecPrivate,
+            width: video.PixelWidth || 0,
+            height: video.PixelHeight || 0,
+            channels: audio.Channels || 2,
+            bitDepth: audio.BitDepth || 0,
+            sampleRate: rate,
+            // Bytes header-stripping removed from every frame, to prepend back.
+            stripped: encoding
+        };
+
+        // Per-frame duration, in timescale ticks. Needed for the final sample of
+        // a cluster, and to space out lacing-packed audio frames.
+        track.defaultDuration = entry.DefaultDuration
+            ? Math.round(entry.DefaultDuration / scale)
+            : Math.round((map.oti === 0x40 ? 1024 : 1152) / rate * timescale);
+
+        var codec = mkv.codecString(track);
+        var mime = (type === 1 ? 'video/mp4' : 'audio/mp4') + '; codecs="' + codec + '"';
+
+        if (!MediaSource.isTypeSupported(mime)) {
+            if (DEBUG_INFO) {
+                console.debug('Unsupported %s track.', type === 1 ? 'video' : 'audio', mime);
+            }
+            if (type === 2) {
+                // Video keeps playing; the player surfaces l[19060].
+                self._hasUnsupportedAudio = codec;
+            }
+            continue;
+        }
+
+        track.mime = mime;
+        track.init = mkv.buildInitSegment(track);
+
+        if (type === 1) {
+            self._hasVideo = codec;
+        }
+        else {
+            self._hasAudio = codec;
+        }
+
+        if (DEBUG_INFO) {
+            console.debug('Track%s: %s -> %s', entry.TrackNumber, codecId, mime);
+        }
+
+        self._trackMap[track.number] = track;
+        self._tracks.push(track);
+        data.push({mime: mime, init: track.init});
+    }
+
+    if (!data.length) {
+        return false;
+    }
+
+    self._fmp4 = true;
+    return data;
+};
+
+/**
+ * Inspect a track's ContentEncodings.
+ *
+ * Matroska lets a track declare that its frames were transformed on the way in.
+ * The only variant we can undo is "header stripping" (ContentCompAlgo 3), where
+ * a run of bytes identical across every frame is removed and stored once in
+ * ContentCompSettings; those bytes simply get prepended back. Anything else --
+ * zlib/bzlib/lzo compression, or encryption -- we cannot reverse.
+ *
+ * @param {Object} entry TrackEntry
+ * @returns {Buffer|null|false} bytes to prepend, null if untouched, false if
+ *                              the encoding is one we cannot undo
+ */
+function readContentEncoding(entry) {
+    var encodings = entry.ContentEncodings;
+
+    if (!encodings) {
+        return null;
+    }
+
+    var encoding = encodings.ContentEncoding;
+    if (Array.isArray(encoding)) {
+        // Several encodings would have to be unwound in order; we only ever
+        // handle the single header-stripping case.
+        if (encoding.length > 1) {
+            return false;
+        }
+        encoding = encoding[0];
+    }
+    if (!encoding) {
+        return null;
+    }
+
+    if (encoding.ContentEncryption) {
+        return false;
+    }
+
+    var compression = encoding.ContentCompression;
+    if (!compression) {
+        return null;
+    }
+
+    // ContentCompAlgo defaults to 0 (zlib) when absent, so an empty
+    // ContentCompression element still means "compressed".
+    if ((compression.ContentCompAlgo | 0) !== 3) {
+        return false;
+    }
+
+    var settings = compression.ContentCompSettings;
+
+    // Algo 3 with no settings strips nothing, which is a no-op rather than a
+    // failure.
+    return settings && settings.length ? settings : null;
+}
+
+/**
+ * Collect the Cues into the seek table used by _findCluster().
+ * @param {Object} segment parsed init segment
+ */
+EBMLRemuxer.prototype._buildSeekTable = function(segment) {
+    if (!segment.Cues) {
+        return;
+    }
+    this._shrink(segment, {Cues: 'CuePoint'});
+
+    var c = segment.Cues;
+    var y = segment.playtime;
+    var t = this._seekTable = [];
+
+    for (var j = c.length; j--;) {
+        var p = c[j];
+        var x = p.CueTrackPositions;
+        var z = Math.round((p.CueTime * segment.timescale) * 1000) / 1000;
+
+        t.push([z, y, x.CueClusterPosition + segment.offset]);
+        y = z;
+    }
+};
+
+/**
+ * Historic path: hand raw EBML straight to a video/webm SourceBuffer.
+ * @param {Array} tracks TrackEntry list
+ * @param {Object} segment parsed init segment
+ * @returns {Array|false} per-track {mime, init}, or false when not applicable
+ */
+EBMLRemuxer.prototype._setupPassthrough = function(tracks, segment) {
     var getCodec = function(codec) {
         var c = String(codec).substr(2).toLowerCase();
         if (c === 'av1') {
@@ -127,35 +389,15 @@ EBMLRemuxer.prototype.emitInitSegment = function(segment) {
     }
 
     if (!this._tracks.length) {
-        return this.destroy(new Error('no playable tracks'));
+        return false;
     }
 
-    if (segment.Cues) {
-        this._shrink(segment, {Cues: 'CuePoint'});
-
-        var c = segment.Cues;
-        var y = segment.playtime;
-        var t = this._seekTable = [];
-
-        for (var j = c.length; j--;) {
-            var p = c[j];
-            var x = p.CueTrackPositions;
-            var z = Math.round((p.CueTime * segment.timescale) * 1000) / 1000;
-
-            t.push([z, y, x.CueClusterPosition + segment.offset]);
-            y = z;
-        }
-    }
-
-    var data = this._tracks.map(function(track) {
+    return this._tracks.map(function(track) {
         return {
             mime: track.mime,
             init: segment.data
         };
     });
-
-    this._initSegment = segment;
-    this.emit('ready', data);
 };
 
 EBMLRemuxer.prototype._shrink = function(segment, props) {
@@ -170,7 +412,9 @@ EBMLRemuxer.prototype._shrink = function(segment, props) {
 
 EBMLRemuxer.prototype._createReader = function(offset, target, event, cb) {
     var self = this;
-    var reader = new EBMLReader(self._file, offset);
+    // The offset-0 scan that finds the init segment runs before _trackMap
+    // exists, so it never pays for frame extraction.
+    var reader = new EBMLReader(self._file, offset, self._trackMap);
 
     if (typeof target === 'string') {
         cb = event;
@@ -192,6 +436,12 @@ EBMLRemuxer.prototype._createReader = function(offset, target, event, cb) {
 EBMLRemuxer.prototype.setInitSegment = function(segment) {
     var self = this;
     var info = segment.Info;
+
+    // Raw TimecodeScale in nanoseconds (Matroska's default is 1ms). The fMP4
+    // path needs it unscaled to derive an integer mdhd timescale, whereas the
+    // passthrough path wants the seconds-per-tick form below.
+    segment.timecodeScale = info && info.TimecodeScale || 1e6;
+
     if (info) {
         segment.timescale = info.TimecodeScale / 1e9;
         segment.playtime = info.Duration * segment.timescale;
@@ -226,6 +476,13 @@ EBMLRemuxer.prototype.setInitSegment = function(segment) {
 EBMLRemuxer.prototype._findCluster = function(time) {
     var offset = 0;
     var t = this._seekTable;
+
+    // The player asks in media time, which once holes have been closed runs
+    // ahead of the file time the cue table is indexed by. Convert in, and report
+    // the fixup back out in media time -- returning a file time there makes
+    // _tryPump() see a permanent discrepancy and coerce backwards on every seek.
+    time = this._fileTimeFor(time);
+
     this._seekTime = time = Math.round(time * 1000) / 1000;
 
     for (var i = 0; i < t.length; ++i) {
@@ -240,7 +497,11 @@ EBMLRemuxer.prototype._findCluster = function(time) {
         }
     }
 
-    this._seekTimeFixup = time;
+    // Cue times are file times, but once holes have been closed the media plays
+    // earlier than the file says. Report the shifted time so the player seeks to
+    // where the data actually landed.
+    this._seekTimeFixup = time - this._skippedBefore(time * this._timescale) / this._timescale;
+
     return offset || this._initSegment.data.length;
 };
 
@@ -250,6 +511,10 @@ EBMLRemuxer.prototype.seek = function(time) {
 
     // console.warn('ebml:seek', time, offset, [this]);
 
+    if (self._fmp4) {
+        return self._seekFmp4(offset);
+    }
+
     return self._tracks.map(function(track, i) {
         if (track.outStream) {
             track.outStream.destroy();
@@ -258,8 +523,245 @@ EBMLRemuxer.prototype.seek = function(time) {
     });
 };
 
+/**
+ * fMP4 counterpart of seek().
+ *
+ * Unlike the passthrough path -- where each track owns its own reader -- video
+ * and audio are interleaved in the same Matroska clusters, so a single reader
+ * is demultiplexed into one stream per track. Giving each track its own reader
+ * would download the file twice.
+ *
+ * @param {Number} offset byte offset of the cluster to start from
+ * @returns {Array} one stream per track, parallel to the 'ready' track list
+ */
+EBMLRemuxer.prototype._seekFmp4 = function(offset) {
+    var self = this;
+
+    if (self._clusterReader) {
+        self._clusterReader.destroy();
+        self._clusterReader = null;
+    }
+
+    var streams = self._tracks.map(function(track) {
+        if (track.outStream) {
+            track.outStream.destroy();
+        }
+        return track.outStream = new Fmp4Segment(self, track);
+    });
+
+    self._openClusterReader(offset, streams);
+
+    return streams;
+};
+
+/**
+ * Attach a cluster reader feeding the given per-track output streams.
+ * @param {Number} offset byte offset of the cluster to read from
+ * @param {Array} streams per-track Fmp4Segment streams
+ */
+EBMLRemuxer.prototype._openClusterReader = function(offset, streams) {
+    var self = this;
+    var endOfStream = function() {
+        for (var i = streams.length; i--;) {
+            if (!streams[i].destroyed) {
+                streams[i].push(null);
+                streams[i].destroy();
+            }
+        }
+        self._clusterReader = null;
+    };
+
+    var reader = self._createReader(offset, 'cluster', function(cluster, timecode, duration, frames) {
+        if (cluster === null) {
+            if (DEBUG_INFO) {
+                console.debug('fmp4 EOS');
+            }
+            endOfStream();
+            this.destroy();
+            return;
+        }
+
+        if (self._resyncGap) {
+            self._measureGap(streams, frames);
+        }
+
+        for (var i = 0; i < self._tracks.length; i++) {
+            streams[i].appendFrames(frames[self._tracks[i].trackId]);
+        }
+    });
+
+    // A malformed or junk-padded element makes the EBML decoder throw, which
+    // would otherwise destroy the reader and end playback early -- exactly what
+    // happens on files carrying inter-cluster padding. Rather than give up,
+    // jump to the next cue point and carry on from there.
+    reader.removeAllListeners('error');
+    reader.on('error', function(err) {
+        // A detected desync knows the exact cluster boundary to restart from;
+        // otherwise fall back to wherever the decoder had got to. Both are
+        // absolute file offsets.
+        var start = this._byteOffset;
+        var from = this._resyncFrom || start + Object(this._decoder)._total;
+        var next = self._nextClusterAfter(Math.max(from, start + 1) - 1);
+
+        this.destroy();
+
+        // Only ever move forward: resyncing to a cluster at or behind where this
+        // reader began would re-read the very bytes that just broke it.
+        if (next > start && self._clusterReader === this) {
+            if (DEBUG_INFO) {
+                console.warn('Recovering from "%s" at %s; resuming at %s.', err && err.message, from, next);
+            }
+            // Whatever sat between here and there is gone; measure the hole off
+            // the first cluster that arrives so playback can run straight over it.
+            self._resyncGap = true;
+            self._openClusterReader(next, streams);
+            return;
+        }
+
+        if (DEBUG_INFO) {
+            console.warn('Unrecoverable read error at %s.', from, err);
+        }
+        endOfStream();
+    });
+
+    self._clusterReader = reader;
+};
+
+/**
+ * Work out how much media a resync skipped, and fold it into _timeShift.
+ *
+ * Called once for the first cluster after a resync. A single shift is derived
+ * from one reference track and applied to every track, so audio and video stay
+ * locked to each other rather than drifting apart by their individual rounding.
+ *
+ * @param {Array} streams per-track output streams
+ * @param {Object} frames trackId -> frame list for the new cluster
+ */
+EBMLRemuxer.prototype._measureGap = function(streams, frames) {
+    this._resyncGap = false;
+
+    for (var i = 0; i < this._tracks.length; i++) {
+        var list = frames[this._tracks[i].trackId];
+        var previousEnd = streams[i].lastRawEnd;
+
+        if (!list || !list.length || previousEnd === null) {
+            continue;
+        }
+
+        // Frames are in storage order, so the earliest presentation time is not
+        // necessarily the first one.
+        var first = list[0].pts;
+        for (var j = 1; j < list.length; j++) {
+            if (list[j].pts < first) {
+                first = list[j].pts;
+            }
+        }
+
+        if (first > previousEnd) {
+            this._recordSkip(previousEnd, first);
+        }
+        return;
+    }
+};
+
+/**
+ * Remember a hole in the file timeline, merging it with any already known.
+ * Re-reading the same damaged region must not widen the total.
+ * @param {Number} from start of the hole, in timescale ticks
+ * @param {Number} to end of the hole, in timescale ticks
+ */
+EBMLRemuxer.prototype._recordSkip = function(from, to) {
+    var merged = [{from: from, to: to}];
+
+    for (var i = 0; i < this._skipped.length; i++) {
+        var range = this._skipped[i];
+        var head = merged[merged.length - 1];
+
+        if (range.from > head.to || range.to < head.from) {
+            merged.push(range);
+        }
+        else {
+            head.from = Math.min(head.from, range.from);
+            head.to = Math.max(head.to, range.to);
+        }
+    }
+
+    merged.sort(function(a, b) {
+        return a.from - b.from;
+    });
+    this._skipped = merged;
+
+    if (DEBUG_INFO) {
+        console.warn('Closing a %sms hole at %s; total skipped now %sms.',
+            to - from, from, this._skippedBefore(Infinity));
+    }
+};
+
+/**
+ * Media time -> file time, the inverse of the hole-closing shift.
+ * @param {Number} mediaTime seconds as the player sees them
+ * @returns {Number} seconds as the file numbers them
+ */
+EBMLRemuxer.prototype._fileTimeFor = function(mediaTime) {
+    var ticks = mediaTime * this._timescale;
+    var shift = 0;
+
+    for (var i = 0; i < this._skipped.length; i++) {
+        // Compare against the hole's start already pulled back by the holes
+        // before it -- that is where it sits on the media timeline.
+        if (this._skipped[i].from - shift > ticks) {
+            break;
+        }
+        shift += this._skipped[i].to - this._skipped[i].from;
+    }
+
+    return (ticks + shift) / this._timescale;
+};
+
+/**
+ * Total media skipped before a point on the file timeline.
+ * @param {Number} pts presentation time, in timescale ticks
+ * @returns {Number} ticks to subtract so the timeline stays contiguous
+ */
+EBMLRemuxer.prototype._skippedBefore = function(pts) {
+    var total = 0;
+
+    for (var i = 0; i < this._skipped.length; i++) {
+        // Keyed on where the hole starts, not where it ends: tracks resume at
+        // slightly different times, so an audio frame can legitimately land
+        // inside a range measured from the video track and still be past it.
+        if (this._skipped[i].from > pts) {
+            break;
+        }
+        total += this._skipped[i].to - this._skipped[i].from;
+    }
+
+    return total;
+};
+
+/**
+ * Next cue'd cluster position strictly after a byte offset.
+ * @param {Number} offset byte offset to search from
+ * @returns {Number} offset of the next cluster, or -1 when there is none
+ */
+EBMLRemuxer.prototype._nextClusterAfter = function(offset) {
+    var t = this._seekTable;
+    var best = -1;
+
+    // The seek table is built back-to-front, so it is not in ascending order.
+    for (var i = 0; t && i < t.length; ++i) {
+        var pos = t[i][2];
+
+        if (pos > offset && (best < 0 || pos < best)) {
+            best = pos;
+        }
+    }
+
+    return best;
+};
+
 // @private
-function EBMLReader(file, offset) {
+function EBMLReader(file, offset, trackMap) {
     this.$etup();
 
     this._file = file;
@@ -275,8 +777,22 @@ function EBMLReader(file, offset) {
     this._trackDefaultDuration = 0;
     this._segment = Object.create(null);
 
+    // fMP4 mode only: split each cluster's blocks into per-track frame lists.
+    this._trackMap = trackMap || null;
+    this._frames = Object.create(null);
+    this._currentTimecode = 0;
+    this._groupFrames = null;
+    this._groupHasRef = false;
+    this._clusterEnd = 0;
+    this._resyncFrom = 0;
+
     try {
-        this.$buffer = new Buffer(0x2000000);
+        // The ring buffer only exists so whole elements can be sliced back out
+        // by absolute offset. The fMP4 path never does that -- it works from the
+        // decoder's own frame data -- so it needs room for one incoming chunk,
+        // not 32MB. Allocating 32MB per reader, on every seek and every resync,
+        // was enough churn to visibly stall the browser.
+        this.$buffer = new Buffer(this._trackMap ? 0x100000 : 0x2000000);
     }
     catch (ex) {
         vsNT(this.emit.bind(this, 'error', ex));
@@ -342,8 +858,61 @@ EBMLReader.prototype._getValue = function(chunk) {
 EBMLReader.prototype._emitCluster = function(duration) {
     var h = ~this._clusterCount & 1;
     var timecode = this._timecodes[h];
-    this.emit('cluster', this._cluster, timecode, duration);
+    var frames = this._frames;
+
+    // The frames gathered so far belong to the cluster being emitted; the next
+    // one starts collecting into a fresh set.
+    this._frames = Object.create(null);
+
+    this.emit('cluster', this._cluster, timecode, duration, frames);
     this._cluster = null;
+};
+
+/**
+ * Split a Block/SimpleBlock into frames and file them under their track.
+ * @param {Object} data decoded EBML tag
+ * @param {Boolean} simple true for SimpleBlock
+ */
+EBMLReader.prototype._collectBlock = function(data, simple) {
+    var parsed = mkv.parseBlock(data.data, simple);
+
+    if (!parsed) {
+        return;
+    }
+
+    var track = this._trackMap[parsed.trackNumber];
+    if (!track) {
+        return;
+    }
+
+    var list = this._frames[track.trackId] || (this._frames[track.trackId] = []);
+    var from = list.length;
+    var pts = this._currentTimecode + parsed.timecode;
+
+    for (var i = 0; i < parsed.frames.length; i++) {
+        var frame = parsed.frames[i];
+
+        if (track.stripped) {
+            // Matroska header stripping: bytes common to every frame are stored
+            // once on the track and removed from the frames themselves. Put them
+            // back, or an H.264 length prefix is short by exactly that much.
+            frame = Buffer.concat([track.stripped, frame]);
+        }
+
+        list.push({
+            // Lacing packs several frames under one timecode; space them out by
+            // the track's frame duration or they all collapse onto one PTS.
+            pts: pts + i * track.defaultDuration,
+            keyframe: parsed.keyframe,
+            data: frame
+        });
+    }
+
+    if (!simple) {
+        // A plain Block carries no keyframe bit -- the enclosing BlockGroup
+        // decides, via the presence of a ReferenceBlock.
+        this._groupFrames = {list: list, from: from};
+    }
 };
 
 EBMLReader.prototype._onFinish = function() {
@@ -358,7 +927,9 @@ EBMLReader.prototype._onFinish = function() {
         this._addTimeCode(t);
 
         v = -dur;
-        this._cluster = this._read(s, b.end);
+        // Same as above: the fMP4 path has no use for the raw bytes, and its
+        // ring buffer is far too small to slice a whole cluster out of.
+        this._cluster = this._trackMap ? true : this._read(s, b.end);
     }
     if (this._cluster !== null) {
         this._emitCluster(v);
@@ -447,6 +1018,15 @@ EBMLReader.prototype._onData = function(state, data) {
             return this._onFinish();
         }
 
+        if (data.name === 'BlockGroup') {
+            this._groupFrames = null;
+            this._groupHasRef = false;
+        }
+
+        if (data.name === 'Cluster') {
+            this._clusterEnd = data.end;
+        }
+
         tmp = Object.create(null);
         tmp.$ = this._segment;
 
@@ -468,6 +1048,15 @@ EBMLReader.prototype._onData = function(state, data) {
         var C = name === 'cluster';
         var E = C && data.end === -1;
 
+        if (name === 'blockgroup' && this._groupFrames) {
+            var group = this._groupFrames;
+
+            for (var g = group.from; g < group.list.length; g++) {
+                group.list[g].keyframe = !this._groupHasRef;
+            }
+            this._groupFrames = null;
+        }
+
         tmp = this._segment;
         this._segment = tmp.$;
         delete tmp.$;
@@ -475,18 +1064,24 @@ EBMLReader.prototype._onData = function(state, data) {
         if (data.end - data.start > 0 || E) {
 
             if (this.listenerCount(name)) {
-                var chunk = !E && this._read(data.start, data.end);
+                // Skip the copy for fMP4 clusters -- those bytes are never read,
+                // and at a megabyte-plus per cluster the churn is not free.
+                var chunk = !E && !(C && this._trackMap) && this._read(data.start, data.end);
 
                 if (C) {
                     if (E) {
                         var s = this._clusterOffset;
                         if (s >= 0) {
-                            this._cluster = this._read(s, data.start);
+                            // fMP4 only needs to know a cluster closed; the raw
+                            // bytes are the passthrough path's business.
+                            this._cluster = this._trackMap ? true : this._read(s, data.start);
                         }
                         this._clusterOffset = data.start;
                     }
                     else {
-                        this._cluster = chunk;
+                        // `chunk` is false on the fMP4 path; anything non-null
+                        // works as the "a cluster closed" sentinel.
+                        this._cluster = chunk || true;
                     }
                 }
                 else {
@@ -504,11 +1099,35 @@ EBMLReader.prototype._onData = function(state, data) {
         }
     }
     else {
+        // Junk bytes inside a Cluster can collide with a real element id -- a
+        // stray 0xEA reads as CueCodecState -- and whatever vint follows is
+        // taken as its size, swallowing the rest of the file. No element may
+        // extend past its Cluster's declared end, so that overrun is a reliable
+        // desync signal; bail out and let the cue table put us back on track.
+        if (this._clusterEnd > 0 && data.end > this._clusterEnd) {
+            // Decoder offsets restart at 0 for every reader, whereas the cue
+            // table holds absolute file positions -- so this has to be rebased,
+            // or the resync lands behind us and loops on the same junk.
+            this._resyncFrom = this._byteOffset + this._clusterEnd;
+
+            return this.destroy(new Error(
+                'Desync: ' + data.name + ' (' + data.dataSize + ' bytes) overruns its cluster.'
+            ));
+        }
+
         if (data.name === 'SimpleBlock' || data.name === 'Block') {
             this._lastBlock = data;
+
+            if (this._trackMap) {
+                this._collectBlock(data, data.name === 'SimpleBlock');
+            }
         }
         else {
             this._segment[data.name] = this._getValue(data);
+
+            if (data.name === 'ReferenceBlock') {
+                this._groupHasRef = true;
+            }
         }
 
         if (data.name === 'Timecode') {
@@ -524,6 +1143,10 @@ EBMLReader.prototype._addTimeCode = function(v) {
     var h = ++this._clusterCount & 1;
 
     this._timecodes[h] = v;
+
+    // Blocks carry a timecode relative to their cluster, so frames collected
+    // from here on are offset against this value.
+    this._currentTimecode = v;
 
     if (this._cluster !== null) {
         this._emitCluster(this._timecodes[h] - this._timecodes[~h & 1]);
@@ -576,6 +1199,96 @@ EBMLReader.prototype._write = function(chunk, enc, cb) {
     }
     catch (ex) {
         this.destroy(ex);
+    }
+};
+
+/**
+ * @private
+ * Output stream for one fMP4 track. The remuxer drives it by handing over the
+ * frames it demultiplexed out of each cluster.
+ * @param {EBMLRemuxer} muxer owning remuxer
+ * @param {Object} track internal track descriptor
+ */
+function Fmp4Segment(muxer, track) {
+    this.$etup();
+
+    var s = muxer._initSegment;
+    this.muxer = muxer;
+    this.track = track;
+    this.segment = s;
+    this.playtime = s.playtime;
+    this.timescale = s.timescale;
+
+    // End of the last batch, before any gap-closing shift, so a later resync can
+    // measure the hole against the file's own timeline.
+    this.lastRawEnd = null;
+
+}
+
+createStream(Fmp4Segment, stream.PassThrough, function() {
+    this.end();
+});
+
+/**
+ * Turn one cluster's worth of frames into a media segment.
+ * @param {Array} [frames] frames belonging to this track
+ */
+Fmp4Segment.prototype.appendFrames = function(frames) {
+    if (this.destroyed || !frames || !frames.length) {
+        return;
+    }
+
+    var track = this.track;
+
+    // Timestamps have to be assigned over the whole cluster: it is one
+    // self-contained reordering group, so splitting first would corrupt the
+    // derived decode order.
+    mkv.assignTimestamps(frames, track.defaultDuration);
+
+    var tail = frames[frames.length - 1];
+    this.lastRawEnd = tail.dts + tail.duration;
+
+    // Pull everything after a skipped cluster back over the hole. Only `dts`
+    // needs moving: `cts` is a delta from it, so composition order is unaffected.
+    // Derived from position rather than a running total, so re-reading a damaged
+    // region after a seek yields the same shift instead of compounding.
+    var shift = this.muxer._skippedBefore(frames[0].pts);
+    if (shift > 0) {
+        for (var s = 0; s < frames.length; s++) {
+            frames[s].dts -= shift;
+        }
+    }
+
+    if (DEBUG_VERBOSE) {
+        console.debug('%s: %s samples, dts %s..%s', this, frames.length,
+            frames[0].dts, frames[frames.length - 1].dts);
+    }
+
+    // Emit in sub-second fragments rather than one per cluster. Clusters can run
+    // to several seconds and a couple of megabytes, and nothing plays until a
+    // whole fragment has arrived -- which stalls playback at the start and after
+    // every seek. MP4Remuxer caps fragments the same way.
+    var limit = MIN_FRAGMENT_DURATION * track.timescale;
+    var from = 0;
+
+    for (var i = 0; i < frames.length; i++) {
+        // Only ever break at a sync sample, exactly as mp4-remuxer.js does.
+        // Splitting mid-GOP would start a fragment on a B-frame whose negative
+        // composition offset places its presentation time before the end of the
+        // previous fragment, and MSE handles that overlap badly. Audio frames
+        // are all sync samples, so they split freely.
+        if (frames[i].keyframe && i > from && frames[i].dts - frames[from].dts >= limit) {
+            // NB: deliberately no `duration` property on the pushed buffer --
+            // that is the passthrough path's signal for videostream.js to start
+            // juggling sb.timestampOffset, which fMP4 must not do since tfdt is
+            // absolute.
+            this.push(mkv.buildMediaSegment(track, frames.slice(from, i)));
+            from = i;
+        }
+    }
+
+    if (from < frames.length) {
+        this.push(mkv.buildMediaSegment(track, frames.slice(from)));
     }
 };
 

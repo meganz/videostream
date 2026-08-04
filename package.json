@@ -9,7 +9,7 @@
     "url": "git://github.com/meganz/videostream.git"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 0",
+    "test": "node test-mkv-fmp4.js && node test-ebml-remuxer.js",
     "build-example": "browserify example/index.js > example/built.js",
     "prebrowserify": "node -e \"require('fs').rmSync('node_modules/range-slice-stream/node_modules',{recursive:true,force:true})\"",
     "browserify": "node ./bundle/build-browserify.js > ./bundle/videostream.js",
