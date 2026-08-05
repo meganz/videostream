@@ -1,4 +1,4 @@
-// Round-trip sanity test for mkv-fmp4.js — run with plain node from the videostream repo root.
+// Round-trip sanity test for mkv-fmp4.js; run with plain node from the repo root.
 var assert = require('assert');
 var Box = require('mp4-box-encoding');
 
@@ -123,30 +123,39 @@ ok('SimpleBlock parsing: signed timecode, Xiph + fixed lacing');
 
 // -------------------------------------------------------- DTS derivation
 // No reordering -> dts == pts, cts == 0.
-var linear = [{pts: 0}, {pts: 40}, {pts: 80}];
-mkv.assignTimestamps(linear, 40);
-assert.deepStrictEqual(linear.map(function(s) { return s.dts; }), [0, 40, 80]);
-assert.deepStrictEqual(linear.map(function(s) { return s.cts; }), [0, 0, 0]);
-assert.deepStrictEqual(linear.map(function(s) { return s.duration; }), [40, 40, 40]);
+var linear = new mkv.Reorderer(0, 40).push([{pts: 0}, {pts: 40}, {pts: 80}]);
+assert.deepStrictEqual(linear.map(function(s) { return s.dts; }), [0, 40]);
+assert.deepStrictEqual(linear.map(function(s) { return s.cts; }), [0, 0]);
+assert.deepStrictEqual(linear.map(function(s) { return s.duration; }), [40, 40]);
 
 // Classic IPBB storage order: presentation order is 0,40,80,120 but stored
 // I(0) P(120) B(40) B(80). DTS must come out monotonic with cts making up
-// the difference — this is the bit that causes stutter when done wrong.
-var reordered = [{pts: 0}, {pts: 120}, {pts: 40}, {pts: 80}];
-mkv.assignTimestamps(reordered, 40);
+// the difference -- this is the bit that causes stutter when done wrong.
+var window4 = new mkv.Reorderer(4, 40);
+var reordered = window4.push([{pts: 0}, {pts: 120}, {pts: 40}, {pts: 80}]);
+assert.strictEqual(reordered.length, 0, 'nothing leaves the window until it fills');
+reordered = window4.flush();
 assert.deepStrictEqual(reordered.map(function(s) { return s.dts; }), [0, 40, 80, 120], 'DTS must be monotonic');
 assert.deepStrictEqual(reordered.map(function(s) { return s.cts; }), [0, 80, -40, -40]);
 for (var i = 0; i < reordered.length; i++) {
     assert.strictEqual(reordered[i].dts + reordered[i].cts, reordered[i].pts, 'dts+cts must reconstruct pts');
 }
-ok('DTS derivation for B-frame reordering');
+
+// Reordering groups routinely straddle cluster boundaries, so the window has to
+// carry across separate push() calls -- sorting each batch alone was the bug
+// that left overlapping fragments and froze video while audio played on.
+var split = new mkv.Reorderer(2, 40);
+var out = split.push([{pts: 0}, {pts: 120}]).concat(split.push([{pts: 40}, {pts: 80}]), split.flush());
+assert.deepStrictEqual(out.map(function(s) { return s.dts; }), [0, 40, 80, 120],
+    'decode order must be derived across batches, not within them');
+ok('DTS derivation for B-frame reordering, across batches');
 
 // ---------------------------------------------------------- media segment
-var samples = [
+var timer = new mkv.Reorderer(0, 40);
+var samples = timer.push([
     {pts: 0, keyframe: true, data: Buffer.from([1, 2, 3, 4])},
     {pts: 40, keyframe: false, data: Buffer.from([5, 6])}
-];
-mkv.assignTimestamps(samples, 40);
+]).concat(timer.flush());
 var seg = mkv.buildMediaSegment(videoTrack, samples);
 
 // NB: mp4-box-encoding leaves trun.decode/tfdt.decode unimplemented upstream,

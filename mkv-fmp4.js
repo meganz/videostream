@@ -1,47 +1,24 @@
 'use strict';
 
-/**
- * Matroska -> fragmented-MP4 helpers.
- *
- * The EBML remuxer historically piped raw Matroska bytes straight into a
- * `video/webm` SourceBuffer, which only works when the file is effectively a
- * WebM (VP8/VP9/AV1 + Vorbis/Opus). Everything else -- most notably H.264 and
- * HEVC, which is what the overwhelming majority of .mkv files carry -- had no
- * playback path at all.
- *
- * This module turns parsed Matroska tracks/frames into an ISO-BMFF init
- * segment (ftyp+moov) and per-cluster media segments (moof+mdat), which MSE
- * accepts on every browser we support. It deliberately reuses the
- * `mp4-box-encoding` boxes that mp4-remuxer.js already registers (avcC, hvcC,
- * VisualSampleEntry aliases for hvc1/hev1, ...) so no new vendor code is
- * pulled in.
- */
+// Matroska -> fragmented-MP4: builds ftyp+moov init segments and moof+mdat
+// media segments, reusing the mp4-box-encoding boxes mp4-remuxer.js registers.
 
 var Box = require('mp4-box-encoding');
 var Buffer = require('buffer').Buffer;
 var tools = require('ebml/lib/ebml/tools');
 
-/**
- * Video CodecIDs we can wrap into fMP4.
- * Matroska stores H.264/HEVC in the very same AVCC length-prefixed form MP4
- * uses, and CodecPrivate *is* the decoder configuration record -- so both the
- * sample data and the config box are straight byte copies, no conversion.
- */
+// CodecPrivate is the decoder configuration record and the frames are already
+// AVCC length-prefixed, so both are straight byte copies.
 var VIDEO_CODECS = {
     'V_MPEG4/ISO/AVC': {entry: 'avc1', config: 'avcC'},
-    // Not a typo: 'IS0' with a digit zero is what some muxers wrote, and
-    // MediaInfo (plus MEGA's codec list) carries entries for both spellings.
+    // Not a typo: some muxers wrote 'IS0' with a digit zero, and MediaInfo
+    // carries entries for both spellings.
     'V_MPEG4/IS0/AVC': {entry: 'avc1', config: 'avcC'},
     'V_MPEGH/ISO/HEVC': {entry: 'hvc1', config: 'hvcC'}
 };
 
-/**
- * Audio CodecIDs we can wrap into fMP4. Anything absent here is reported
- * through `unsupportedAudio` so the player drops the track and plays the video
- * silently (see l[19060] "Unsupported audio codec (%1)"), which is what
- * happens for DTS, AC-3, E-AC-3, TrueHD and friends -- no browser can decode
- * those through MSE.
- */
+// Anything absent is reported as unsupported audio, so the track is dropped and
+// the video plays silently -- DTS, AC-3, E-AC-3 and TrueHD all land there.
 var AUDIO_CODECS = {
     'A_AAC': {entry: 'mp4a', oti: 0x40},
     'A_MPEG/L3': {entry: 'mp4a', oti: 0x6b},
@@ -54,10 +31,8 @@ var SELF_CONTAINED_DREF = {
     entries: [{type: 'url ', buf: Buffer.from([0, 0, 0, 1])}]
 };
 
-// mp4-box-encoding only knows avc1/mp4a. mp4-remuxer.js registers hvc1/hev1
-// and the hvcC codec, but relying on it having been loaded first is an
-// implicit load-order dependency -- so claim the aliases we need ourselves.
-// All of these are idempotent, and Box.encode() throws on an unknown type.
+// Claimed here rather than relying on mp4-remuxer.js having loaded first;
+// Box.encode() throws on an unknown type.
 Box.boxes.hvc1 = Box.boxes.hvc1 || Box.boxes.VisualSampleEntry;
 Box.boxes.hev1 = Box.boxes.hev1 || Box.boxes.VisualSampleEntry;
 Box.boxes.fLaC = Box.boxes.fLaC || Box.boxes.AudioSampleEntry;
@@ -83,11 +58,6 @@ function lookupCodec(codecId, type) {
 
 /**
  * Derive the RFC 6381 codec string MSE needs for this track.
- *
- * For H.264/HEVC we hand CodecPrivate to the very same avcC/hvcC decoders
- * mp4-remuxer.js uses, so an MKV and an MP4 carrying identical video end up
- * advertising an identical codec string.
- *
  * @param {Object} track internal track descriptor
  * @returns {String} e.g. 'avc1.640029', 'hvc1.1.6.L93.90', 'mp4a.40.2'
  */
@@ -102,18 +72,16 @@ function codecString(track) {
             try {
                 var info = box.decode(priv, 0, priv.length);
 
-                // avcC yields the bare '640029' hex triplet, hvcC a leading-dot
-                // '.1.6.L93.90' -- match how mp4-remuxer.js concatenates each.
+                // avcC yields a bare hex triplet, hvcC a leading-dot string.
                 if (map.config === 'avcC') {
                     return map.entry + '.' + info.mimeCodec;
                 }
                 return map.entry + info.mimeCodec;
             }
             catch (ex) {
-                // A truncated or malformed configuration record must not take
-                // the whole file down: fall through to the bare entry name,
-                // which isTypeSupported() will almost certainly reject, and the
-                // track gets skipped cleanly.
+                // Fall through to the bare entry name, which isTypeSupported()
+                // rejects, so a malformed record skips the track rather than
+                // taking the file down.
                 if (window.d) {
                     console.warn('Malformed %s, ignoring track.', map.config, ex);
                 }
@@ -134,9 +102,8 @@ function codecString(track) {
 }
 
 /**
- * Encode an MPEG-4 descriptor length using the expandable format.
  * @param {Number} len byte length being described
- * @returns {Array} big-endian length bytes
+ * @returns {Array} MPEG-4 expandable length bytes
  */
 function descriptorLength(len) {
     if (len < 0x80) {
@@ -151,7 +118,6 @@ function descriptorLength(len) {
 }
 
 /**
- * Wrap a payload in an MPEG-4 descriptor.
  * @param {Number} tag descriptor tag
  * @param {Array} payload descriptor body bytes
  * @returns {Array} tag + length + body
@@ -161,20 +127,14 @@ function descriptor(tag, payload) {
 }
 
 /**
- * Build the body of an `esds` box for a track.
- *
- * `esds` is registered as a full box, so mp4-box-encoding writes the
- * version/flags word itself and copies `buffer` verbatim after it -- meaning
- * this must return the bare ES_Descriptor.
- *
+ * Body of an `esds` box. It is a full box, so mp4-box-encoding writes the
+ * version/flags word itself -- this returns the bare ES_Descriptor.
  * @param {Number} oti objectTypeIndication (0x40 AAC, 0x6b MP3, ...)
  * @param {Buffer} [asc] DecoderSpecificInfo, i.e. Matroska CodecPrivate
  * @returns {Buffer} ES_Descriptor bytes
  */
 function buildEsds(oti, asc) {
-    // DecoderConfigDescriptor: oti, streamType(audio=5)<<2|upStream<<1|reserved,
-    // bufferSizeDB (3B), maxBitrate (4B), avgBitrate (4B). Bitrates are
-    // advisory; zero is accepted everywhere and avoids lying about the stream.
+    // oti, streamType|upStream|reserved, bufferSizeDB, maxBitrate, avgBitrate.
     var dcd = [oti, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
     if (asc && asc.length) {
@@ -210,8 +170,7 @@ function buildSampleEntry(track) {
     else {
         entry.channelCount = track.channels;
         entry.sampleSize = track.bitDepth || 16;
-        // AudioSampleEntry writes this as a raw uint32, but the field is 16.16
-        // fixed point -- so it has to be pre-scaled. Multiplication, not `<<`:
+        // 16.16 fixed point, written as a raw uint32. Multiplication, not `<<`:
         // 44100 << 16 overflows JS's signed 32-bit bitwise range.
         entry.sampleRate = (track.sampleRate | 0) * 0x10000;
 
@@ -303,11 +262,8 @@ function emptyTable() {
 }
 
 /**
- * Split a Matroska Block/SimpleBlock into its constituent frames.
- *
- * Lacing matters here: video effectively never uses it, but AAC and MP3 audio
- * in Matroska routinely pack several frames into one block.
- *
+ * Split a Matroska Block/SimpleBlock into frames. Lacing is common on AAC and
+ * MP3 audio, which pack several frames into one block.
  * @param {Buffer} data raw block payload
  * @param {Boolean} simple true for SimpleBlock (carries the keyframe flag)
  * @returns {Object|false} {trackNumber, timecode, keyframe, frames}
@@ -392,76 +348,14 @@ function parseBlock(data, simple) {
 }
 
 /**
- * Assign decode timestamps to a cluster's samples.
- *
- * Matroska only stores presentation timestamps. MP4 needs a decode timestamp
- * plus a composition offset, and for H.264/HEVC with B-frames the two differ.
- * Because a Matroska cluster starts on a keyframe and therefore holds a
- * self-contained reordering group, the decode order is simply the presentation
- * timestamps sorted ascending -- no SPS parsing or sliding window required.
- *
- * @param {Array} samples samples in decode (storage) order, each with a `pts`
- * @param {Number} defaultDuration fallback duration for the final sample
- */
-function assignTimestamps(samples, defaultDuration) {
-    var i;
-    var reordered = false;
-
-    for (i = 1; i < samples.length; i++) {
-        if (samples[i].pts < samples[i - 1].pts) {
-            reordered = true;
-            break;
-        }
-    }
-
-    if (reordered) {
-        var sorted = samples.map(function(s) {
-            return s.pts;
-        }).sort(function(a, b) {
-            return a - b;
-        });
-
-        for (i = 0; i < samples.length; i++) {
-            samples[i].dts = sorted[i];
-            samples[i].cts = samples[i].pts - sorted[i];
-        }
-    }
-    else {
-        for (i = 0; i < samples.length; i++) {
-            samples[i].dts = samples[i].pts;
-            samples[i].cts = 0;
-        }
-    }
-
-    for (i = 0; i < samples.length; i++) {
-        samples[i].duration = i + 1 < samples.length
-            ? samples[i + 1].dts - samples[i].dts
-            : defaultDuration;
-
-        if (!(samples[i].duration > 0)) {
-            samples[i].duration = defaultDuration;
-        }
-    }
-}
-
-/**
  * Streaming decode-order timestamper.
  *
- * Matroska stores only presentation times; MP4 needs a decode time plus a
- * composition offset. For a stream with B-frames the decode timeline is simply
- * the presentation times sorted ascending -- the Nth frame in storage order
- * takes the Nth smallest PTS.
- *
- * Doing that per cluster only works when a cluster holds whole reordering
- * groups. Real files routinely break that: HEVC with B-pyramids reorders across
- * 4-5 frames, and clusters can be shorter than that, so a group straddles the
- * boundary. Sorting each cluster in isolation then yields fragments whose
- * presentation ranges overlap and run backwards, which the browser turns into
- * holes in its buffered range.
- *
- * So frames are held in a window instead: a frame's decode time is only fixed
- * once enough later frames have arrived that no smaller presentation time can
- * still turn up. That is boundary-agnostic by construction.
+ * Matroska stores only presentation times, so decode times are the presentation
+ * times sorted ascending. Sorting per cluster is wrong when a reordering group
+ * straddles a cluster boundary -- routine with HEVC B-pyramids and short
+ * clusters -- and yields fragments that overlap and run backwards. Frames are
+ * held in a window instead, so a decode time is fixed only once no smaller
+ * presentation time can still arrive.
  *
  * @param {Number} depth frames to keep in hand; must exceed the reorder depth
  * @param {Number} defaultDuration fallback for the final frame, in ticks
@@ -635,6 +529,5 @@ module.exports = {
     codecString: codecString,
     buildInitSegment: buildInitSegment,
     buildMediaSegment: buildMediaSegment,
-    assignTimestamps: assignTimestamps,
     parseBlock: parseBlock
 };
