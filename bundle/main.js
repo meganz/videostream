@@ -801,6 +801,7 @@ Streamer.prototype.onPlayBackEvent = function(playing) {
 };
 
 Streamer.prototype.canSwitchAudioTrack = tryCatch(function(error) {
+    var file = this.file || false;
     var stream = this.stream || false;
     var muxer = stream._muxer || false;
     if (stream instanceof VideoStream && muxer._chosenAudioTrack >= 0) {
@@ -818,7 +819,28 @@ Streamer.prototype.canSwitchAudioTrack = tryCatch(function(error) {
             self.stream.destroy();
         })();
 
-        this.stream = new VideoStream(this.file, this.video, this.options);
+        if (String(error).includes('DEMUXER_ERROR')
+            && self.hasStartedPlaying === false && file.filesize < MIN_CACHE && !self.msefallback) {
+
+            self.msefallback = 1;
+            file.fetcher(file.data, 0, file.filesize)
+                .then(function(data) {
+                    self.msefallback = (data.buffer || data).slice(0);
+                    self.video.src = mObjectURL([self.msefallback]);
+                })
+                .catch(function(ex) {
+                    console.warn(ex);
+                });
+        }
+        else if (self.msefallback && String(error).includes('PIPELINE_ERROR_READ')) {
+            var ct = self.video.currentTime;
+            URL.revokeObjectURL(self.video.src);
+            self.video.src = mObjectURL([self.msefallback]);
+            self.video.currentTime = ct;
+        }
+        else {
+            this.stream = new VideoStream(this.file, this.video, this.options);
+        }
         return true;
     }
 
