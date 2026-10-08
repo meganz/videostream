@@ -44,6 +44,7 @@ function AudioStream(file, mediaElem, opts) {
     self._videoContext = null;
     self._audioContext = context;
     self._audioAnalyser = null;
+    self._haveEncodingError = false;
     self._isWebkitSafari = window.safari || ua.details.engine === 'Webkit';
 
     var fileStream = file.createReadStream({start: 0});
@@ -221,6 +222,16 @@ AudioStream.prototype._decode = function(opts) {
         }
         len = data.byteLength;
 
+        var offset = len - 0x1000000;
+        if (offset > 0x80000) {
+            try {
+                data.copy = data.slice(0, offset);
+            }
+            catch (ex) {
+                log(ex);
+            }
+        }
+
         if (d > 1) {
             log('Decoding new chunk...', done, len);
         }
@@ -237,7 +248,16 @@ AudioStream.prototype._decode = function(opts) {
                     log(ex);
                 }
                 if (done) {
-                    self.destroy(ex);
+                    if (ex && ex.name === 'EncodingError') {
+                        self._haveEncodingError = ex;
+
+                        if (data.copy) {
+                            self._buffer = new Uint8Array(data.copy);
+                        }
+                    }
+                    else {
+                        self.destroy(ex);
+                    }
                 }
                 self._decTick = 1e11;
             })
@@ -253,6 +273,7 @@ AudioStream.prototype._decode = function(opts) {
                 if (again) {
                     self._decode(opts);
                 }
+                delete data.copy;
             });
     }
 };
@@ -455,10 +476,15 @@ AudioStream.prototype._resume = SoonFc(40, function() {
 
 AudioStream.prototype._endOfStream = tryCatch(function() {
     if (!this._ended) {
+        var self = this;
         var v = this._elem;
         var dsp = function() {
             v.removeEventListener('pause', dsp);
             v.dispatchEvent(new Event('ended'));
+
+            if (self._haveEncodingError) {
+                self.destroy(self._haveEncodingError);
+            }
         };
         this._ended = true;
 
