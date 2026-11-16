@@ -11,6 +11,7 @@ var locale = require('./bundle/locale');
 // if we want to ignore fewer, just skip them.
 var FIND_MOOV_SEEK_SIZE = 4096;
 var SILENT_PLAYBACK = parseInt(localStorage.vsna);
+var MAX_SAMPLES = Math.pow(2, 23); // per track, ~24h at 60fps fits well within
 
 module.exports = MP4Remuxer
 
@@ -331,6 +332,13 @@ MP4Remuxer.prototype._processMoov = function (moov) {
         if (!decodingTimeEntry.value) {
             console.warn("No 'stts' entries for trak %s...", i, trak);
             continue;
+        }
+
+        // the declared count drives the loop below, constant-size samples must fit in the file
+        var sampleCount = stbl.stsz.sample_count;
+        if (sampleCount > MAX_SAMPLES || stbl.stsz.sample_size * sampleCount > self._file.filesize) {
+            self.emit('error', new Error('Unsupported media format, invalid sample count...'));
+            return;
         }
 
         while (true) {
@@ -1079,4 +1087,29 @@ Box.boxes.stsz.decode = function(buf, offset) {
         sample_count: num,
         entries: entries
     }
+};
+
+// A box smaller than its own header (e.g. size 0) would never advance a child walk.
+var boxDecode = Box.decode;
+Box.decode = function(buffer, start, end) {
+    var headers = Box.readHeaders(buffer, start || 0, end || buffer.length);
+    if (typeof headers === 'object' && headers.length < headers.headersLen) {
+        return new Error('Unsupported media format, invalid box size...');
+    }
+    return boxDecode.apply(this, arguments);
+};
+
+// Bound the entries by the bytes present rather than the declared count.
+Box.boxes.stsd.decode = function(buf, offset, end) {
+    buf = buf.slice(offset, end);
+    var num = buf.readUInt32BE(0);
+    var entries = [];
+    var ptr = 4;
+    while (entries.length < num && buf.length - ptr >= 8) {
+        var entry = Box.decode(buf, ptr, buf.length);
+        entries.push(entry);
+        if (!(entry.length > 0)) break;
+        ptr += entry.length;
+    }
+    return {entries: entries};
 };
