@@ -801,9 +801,14 @@ Streamer.prototype.onPlayBackEvent = function(playing) {
 };
 
 Streamer.prototype.canSwitchAudioTrack = tryCatch(function(error) {
+    var self = this;
+    var file = this.file || false;
     var stream = this.stream || false;
     var muxer = stream._muxer || false;
-    if (stream instanceof VideoStream && muxer._chosenAudioTrack >= 0) {
+    if (self.msefallback === undefined) {
+        self.msefallback = !!(self.hasStartedPlaying === false && file.filesize < (MAX_CACHE << 1));
+    }
+    if (stream instanceof VideoStream && (self.msefallback || muxer._chosenAudioTrack >= 0)) {
         if (!this.options.bat) {
             this.options.bat = Object.create(null);
         }
@@ -813,12 +818,36 @@ Streamer.prototype.canSwitchAudioTrack = tryCatch(function(error) {
             console.info('Stream error, attempting to switch to another audio track...', error, this.options);
         }
 
-        var self = this;
         tryCatch(function() {
             self.stream.destroy();
         })();
 
-        this.stream = new VideoStream(this.file, this.video, this.options);
+        if (self.msefallback === true) {
+            self.msefallback = -1;
+            file.fetcher(file.data, 0, file.filesize)
+                .then(function(data) {
+                    self.msefallback = (data.buffer || data).slice(0);
+                    self.video.src = mObjectURL([self.msefallback]);
+                })
+                .catch(function(ex) {
+                    console.warn(ex);
+                });
+        }
+        else if (self.msefallback.byteLength && String(error).includes('PIPELINE_ERROR_READ')) {
+            var ct = self.video.currentTime;
+            URL.revokeObjectURL(self.video.src);
+            self.video.src = mObjectURL([self.msefallback]);
+            self.video.currentTime = ct;
+        }
+        else {
+            if (self.msefallback) {
+                self.msefallback = 0;
+                if (muxer._chosenAudioTrack === undefined) {
+                    return false;
+                }
+            }
+            this.stream = new VideoStream(this.file, this.video, this.options);
+        }
         return true;
     }
 
